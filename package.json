@@ -1,0 +1,14 @@
+{
+  "name": "newrelic-chatgpt-plugin",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "bash scripts/build.sh",
+    "validate": "node scripts/validate-artifact.mjs",
+    "test": "node scripts/test-mcp.mjs",
+    "check": "python3 scripts/check-distribution.py",
+    "package": "python3 scripts/package-release.py"
+  },
+  "version": "0.3.0",
+  "license": "MIT"
+}

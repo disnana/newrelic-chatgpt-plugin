@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#111827">
+    <title>New Relic × ChatGPT</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        --bg:#f3f5fa; --panel:#fff; --text:#171b29; --muted:#667085;
+        --line:#e0e4ed; --accent:#6558e8; --soft:#efedff; --ok:#178454; --bad:#bd3535;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root { --bg:#0d111b; --panel:#151b29; --text:#f3f5fa; --muted:#a5afc2; --line:#2b3446; --accent:#a79cff; --soft:#272342; --ok:#55d39d; --bad:#ff8585; }
+      }
+      * { box-sizing:border-box; }
+      body { min-height:100vh; margin:0; padding:clamp(18px,5vw,56px); background:var(--bg); color:var(--text); }
+      main { width:min(100%,760px); margin:0 auto; }
+      .eyebrow { margin:0 0 18px; color:var(--muted); font-size:.86rem; font-weight:650; letter-spacing:.04em; }
+      h1 { max-width:680px; margin:0; font-size:clamp(2rem,7vw,3.4rem); line-height:1.08; letter-spacing:-.045em; }
+      .intro { max-width:640px; margin:18px 0 28px; color:var(--muted); font-size:clamp(1rem,2.8vw,1.12rem); line-height:1.75; }
+      .card { margin-top:16px; padding:clamp(20px,5vw,30px); border:1px solid var(--line); border-radius:22px; background:var(--panel); box-shadow:0 12px 36px #1118270c; }
+      .card h2 { margin:0 0 8px; font-size:1.2rem; }
+      .card p { margin:0; color:var(--muted); line-height:1.65; }
+      .status { display:flex; align-items:center; gap:10px; margin:18px 0; font-weight:700; }
+      .dot { width:10px; height:10px; border-radius:50%; background:#9aa3b2; }
+      .status[data-state="connected"] .dot { background:var(--ok); }
+      .status[data-state="error"] .dot { background:var(--bad); }
+      .controls { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:12px; align-items:end; margin-top:20px; }
+      label { display:grid; gap:8px; color:var(--muted); font-size:.9rem; font-weight:650; }
+      select { width:100%; min-height:50px; padding:0 12px; border:1px solid var(--line); border-radius:12px; background:var(--panel); color:var(--text); font:inherit; }
+      button, .button { display:inline-flex; min-height:50px; align-items:center; justify-content:center; padding:0 18px; border:0; border-radius:13px; background:var(--accent); color:#fff; text-decoration:none; cursor:pointer; font:inherit; font-weight:700; touch-action:manipulation; }
+      button.secondary, .button.secondary { border:1px solid var(--line); background:transparent; color:var(--text); }
+      button:focus-visible, .button:focus-visible, select:focus-visible { outline:3px solid var(--text); outline-offset:3px; }
+      button:disabled { cursor:wait; opacity:.65; }
+      .actions { display:flex; flex-wrap:wrap; gap:10px; margin-top:20px; }
+      .actions button { flex:1 1 150px; }
+      .hint { margin-top:14px !important; font-size:.9rem; }
+      .error { color:var(--bad) !important; }
+      .note { margin:20px 2px 0; padding:16px 18px; border-left:3px solid var(--accent); border-radius:0 12px 12px 0; background:var(--soft); color:var(--muted); line-height:1.65; }
+      .note strong { color:var(--text); }
+      footer { margin-top:28px; color:var(--muted); font-size:.82rem; line-height:1.6; }
+      [hidden] { display:none !important; }
+      @media (max-width:480px) {
+        body { padding:22px 16px 32px; }
+        .controls { grid-template-columns:1fr; }
+        .controls button { width:100%; }
+        .actions { display:grid; grid-template-columns:1fr; }
+        .actions button, .actions .button { width:100%; }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <p class="eyebrow">ChatGPT Sites · New Relic 読み取り専用 MCP</p>
+      <h1>監視データを<br>チャットから調べる</h1>
+      <p class="intro">Disnanaによる非公式のNew Relic連携です。New Relic公式OAuthで接続し、アカウント・NRQL・メトリクス・ログ・アラートをChatGPTから確認できます。トークンは暗号化してサーバー側に保存します。</p>
+
+      <section class="card" aria-labelledby="connection-title">
+        <h2 id="connection-title">New Relic接続</h2>
+        <p>接続を開始するとNew Relicの公式ログイン画面へ移動します。要求する権限は監視データの読み取りです。</p>
+        <div id="status" class="status" data-state="loading" role="status" aria-live="polite">
+          <span class="dot" aria-hidden="true"></span><span id="status-text">接続状態を確認しています…</span>
+        </div>
+        <p id="identity-hint" class="hint" hidden></p>
+        <div id="connect-panel" hidden>
+          <div class="controls">
+            <label for="region">New Relicリージョン
+              <select id="region">
+                <option value="us">米国（US）</option>
+                <option value="eu">欧州（EU）</option>
+                <option value="jp">日本（JP）</option>
+              </select>
+            </label>
+            <a id="connect-link" class="button" href="/oauth/start?region=us" target="_blank" rel="noopener noreferrer">New Relicに接続</a>
+          </div>
+          <p class="hint">認証後にブラウザーがlocalhostへ移動します。接続エラー画面が出たら、アドレス欄のURL全体をコピーし、<a href="/oauth/complete">認証完了ページ</a>へ貼り付けてください。</p>
+        </div>
+        <div id="connected-panel" hidden>
+          <p id="connection-detail"></p>
+          <div class="controls">
+            <label for="account">使用するNew Relicアカウント
+              <select id="account"></select>
+            </label>
+            <button id="select-account" type="button" class="secondary">アカウントを選択</button>
+          </div>
+          <p id="account-hint" class="hint"></p>
+          <div class="actions">
+            <button id="refresh" type="button" class="secondary">状態を再確認</button>
+            <button id="disconnect" type="button" class="secondary">接続を解除</button>
+          </div>
+        </div>
+      </section>
+
+      <p class="note"><strong>使い方：</strong>接続とアカウント選択の後は、iPhone版ChatGPTの通常チャットで「ScyllaDBの直近30分を調べて」のように頼めます。アカウントIDやNRQLを毎回入力する必要はありません。</p>
+      <footer>ChatGPT Sites MCP · New Relic公式MCPを読み取り専用で利用 · ログやチャットへOAuthトークンを出力しません</footer>
+    </main>
+    <script>
+      const statusBox = document.querySelector("#status");
+      const statusText = document.querySelector("#status-text");
+      const connectPanel = document.querySelector("#connect-panel");
+      const connectedPanel = document.querySelector("#connected-panel");
+      const identityHint = document.querySelector("#identity-hint");
+      const accountSelect = document.querySelector("#account");
+      const accountHint = document.querySelector("#account-hint");
+      const connectionDetail = document.querySelector("#connection-detail");
+      const connectLink = document.querySelector("#connect-link");
+
+      async function api(path, options) {
+        const response = await fetch(path, Object.assign({ cache: "no-store" }, options || {}));
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "リクエストに失敗しました。");
+        return data;
+      }
+
+      function setStatus(state, message) {
+        statusBox.dataset.state = state;
+        statusText.textContent = message;
+      }
+
+      async function loadAccounts(selected) {
+        try {
+          const data = await api("/api/accounts");
+          accountSelect.replaceChildren();
+          for (const account of data.accounts || []) {
+            const option = document.createElement("option");
+            option.value = account.id;
+            option.textContent = account.name ? account.name + "（" + account.id + "）" : account.id;
+            option.selected = account.id === (selected && selected.id);
+            accountSelect.append(option);
+          }
+          if (!data.accounts || data.accounts.length === 0) {
+            accountHint.textContent = "アカウント一覧を取得できませんでした。ChatGPTのチャットで list_accounts を実行してください。";
+          } else if (data.accounts.length === 1) {
+            accountHint.textContent = "利用可能なアカウントは1件です。自動で選択しました。";
+          } else if (data.selectedAccount) {
+            accountHint.textContent = "選択したアカウントを次回以降も使います。";
+          } else {
+            accountHint.textContent = "複数アカウントがあります。使用するものを選んでください。";
+          }
+        } catch (error) {
+          accountHint.textContent = error.message;
+          accountHint.classList.add("error");
+        }
+      }
+
+      async function refresh() {
+        setStatus("loading", "接続状態を確認しています…");
+        identityHint.hidden = true;
+        connectPanel.hidden = true;
+        connectedPanel.hidden = true;
+        try {
+          const state = await api("/api/status");
+          if (!state.authenticated) {
+            setStatus("error", "ChatGPTのSiteセッションを確認できません");
+            identityHint.textContent = state.message || "ChatGPTアカウントでSiteを開き直してください。";
+            identityHint.hidden = false;
+            return;
+          }
+          if (!state.connected) {
+            setStatus("disconnected", "New Relic未接続");
+            connectPanel.hidden = false;
+            return;
+          }
+          if (state.requiresReauthentication) {
+            setStatus("error", "New Relicの再接続が必要です");
+            identityHint.textContent = "認証期限が切れたか、アクセスが取り消されました。New Relicにもう一度接続してください。";
+            identityHint.hidden = false;
+            connectPanel.hidden = false;
+            return;
+          }
+          setStatus("connected", "New Relic接続済み");
+          const date = state.connectedAt ? new Date(state.connectedAt).toLocaleString("ja-JP") : "";
+          connectionDetail.textContent = "接続日時: " + (date || "不明") + " · リージョン: " + state.region.toUpperCase();
+          connectedPanel.hidden = false;
+          await loadAccounts(state.selectedAccount);
+        } catch (error) {
+          setStatus("error", "状態を取得できません");
+          identityHint.textContent = error.message;
+          identityHint.hidden = false;
+        }
+      }
+
+      document.querySelector("#region").addEventListener("change", (event) => {
+        connectLink.href = "/oauth/start?region=" + encodeURIComponent(event.target.value);
+      });
+      document.querySelector("#refresh").addEventListener("click", refresh);
+      document.querySelector("#select-account").addEventListener("click", async () => {
+        const button = document.querySelector("#select-account");
+        button.disabled = true;
+        try {
+          const result = await api("/api/select-account", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ accountId: accountSelect.value }),
+          });
+          accountHint.textContent = result.message || "アカウントを選択しました。";
+          accountHint.classList.remove("error");
+        } catch (error) {
+          accountHint.textContent = error.message;
+          accountHint.classList.add("error");
+        } finally {
+          button.disabled = false;
+        }
+      });
+      document.querySelector("#disconnect").addEventListener("click", async () => {
+        const button = document.querySelector("#disconnect");
+        button.disabled = true;
+        try {
+          await api("/api/disconnect", { method: "POST" });
+          await refresh();
+        } catch (error) {
+          accountHint.textContent = error.message;
+          accountHint.classList.add("error");
+        } finally {
+          button.disabled = false;
+        }
+      });
+
+      refresh();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,9 @@
+dist/
+outputs/
+.env
+.env.*
+!.env.example
+node_modules/
+*.db
+*.sqlite*
+__pycache__/
