@@ -1,0 +1,2 @@
+SELECT count(*) FROM Log SINCE 30 minutes ago LIMIT 100
+SELECT keyset() FROM Metric SINCE 30 minutes ago LIMIT 100
