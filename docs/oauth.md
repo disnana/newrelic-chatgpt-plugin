@@ -1,0 +1,13 @@
+# OAuth
+
+公式Authorization Code + PKCEを使用。SiteユーザーIDをハッシュ化しstateとトークンの保存先を分離する。stateは10分・1回限りで、ユーザーとredirect URIを検証する。
+
+公開クライアントIDは秘密ではない。個人のaccess/refresh tokenや暗号鍵は配布物に含まない。トークンはAES-GCMでD1に保存する。各自のSiteごとに独立した32バイトのbase64url暗号鍵をSecretに設定する。鍵をチャットに貼らない。
+
+現在はlocalhost callbackのURL全体をSite内の認証完了ページへ貼り付ける方式。URLにcodeがなくaccess_deniedがある場合は認証未完了。New RelicのFeature Controlや組織権限を確認する。URLをチャット・Issueに貼らない。
+
+refreshはD1のユーザー別リースと条件付き保存で競合を制御する。モックでは同時更新と接続変更後の上書き拒否を確認。本番でのリース期限切れ、障害復旧、別ユーザーの全経路は未検証。
+
+Siteからの接続解除はローカル保存情報の削除であり、New Relic側の許可取消しは別操作。公式OAuthクライアント利用条件が変わる場合がある。
+
+https://docs.newrelic.com/docs/agentic-ai/mcp/overview/
