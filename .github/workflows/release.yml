@@ -1,0 +1,43 @@
+name: Release
+on:
+  push:
+    branches: [main]
+    paths: [VERSION]
+permissions:
+  contents: read
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+  release:
+    needs: checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Read version
+        id: version
+        run: python3 scripts/read-version.py >> "$GITHUB_OUTPUT"
+      - run: npm run build
+      - run: node scripts/validate-artifact.mjs
+      - name: Package and validate
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: python3 scripts/package-release.py "$RELEASE_TAG"
+      - name: Create immutable tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          gh api --method POST "repos/$GH_REPO/git/refs" -f "ref=refs/tags/$RELEASE_TAG" -f "sha=$RELEASE_SHA"
+          gh release create "$RELEASE_TAG" outputs/*.zip outputs/checksums.txt --verify-tag --generate-notes
