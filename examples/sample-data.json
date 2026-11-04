@@ -1,0 +1,18 @@
+{
+  "synthetic": true,
+  "service": "example-database",
+  "observations": [
+    {
+      "rack": "rack1",
+      "latencyMs": 12
+    },
+    {
+      "rack": "rack2",
+      "latencyMs": 18
+    },
+    {
+      "rack": "rack3",
+      "latencyMs": 15
+    }
+  ]
+}
