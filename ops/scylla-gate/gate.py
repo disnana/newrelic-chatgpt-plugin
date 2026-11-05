@@ -463,13 +463,13 @@ def heartbeat(cfg, state, conn, now, key, samples):
     for tid, (ts, payload) in samples.items():
         instance = instances.get(tid, tid)
         metrics = aggregated_metrics(payload, instance, 'normal', ts)
+        derived = []
         for kind, p95 in state.get('last_p95_ms', {}).get(tid, {}).items():
-            metrics.append({'name': 'scylla_gate_coordinator_' + kind + '_p95_bucket_ms',
+            derived.append({'name': 'scylla_gate_coordinator_' + kind + '_p95_bucket_ms',
                             'type': 'gauge', 'value': p95, 'timestamp': ts * 1000,
                             'attributes': {'instance': instance, 'telemetry.pipeline': 'scylla-gate'}})
-        # A single heartbeat should be bounded even if a future metric adds labels.
-        metrics = metrics[-2:] + metrics[:-2] if state.get('last_p95_ms', {}).get(tid) else metrics
-        metrics = metrics[:int(cfg.get('max_heartbeat_series_per_node', 200))]
+        # Derived p95 must survive the heartbeat cardinality cap.
+        metrics = (derived + metrics)[:int(cfg.get('max_heartbeat_series_per_node', 200))]
         try:
             send_chunks(metrics, cfg, conn, ident=f'heartbeat:{tid}:{ts}', now=now, key=key)
         except Exception as exc:
