@@ -1,49 +1,82 @@
-# Scylla Gate (experimental, v1.0.0)
+# Scylla Gate v1.1.0 — incident-gated New Relic telemetry
 
-Replaces only the existing `scylla-prometheus.yml` New Relic integration with a bounded Python metric collection service on the **existing collector**. The Infrastructure Agent stays enabled.
+Run **only on the current centralized collector** (`oracle-cloud-core`). The collector scrapes all three configured ScyllaDB targets. **Do not install this on the ScyllaDB nodes**, which would duplicate ingest. The existing New Relic Infrastructure Agent remains active.
 
-## Installation
+## Upgrade existing v1.0 installation / first installation
 
-On `oracle-cloud-core` (the existing collector), run:
+After merging this PR into main, run once on the **collector**:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/disnana/newrelic-chatgpt-plugin/feature/scylla-local-gate-20261105/ops/scylla-gate/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/disnana/newrelic-chatgpt-plugin/main/ops/scylla-gate/install.sh | sudo bash
 ```
 
-The installer auto-discovers the Scylla `/metrics` endpoints from the original integration, downloads a SHA-256-pinned controller, checks source connectivity and New Relic Metric API acceptance, backs up the original integration, installs and tests a new systemd collector, then disables only the original Scylla integration. If preflight fails, the old collector stays active. After a failed cutover it attempts to restore the old integration.
+The installer finds the original `scylla-prometheus.yml` or `.disabled` configuration, discovers the same targets, downloads a SHA-256-pinned controller, runs a self-test, checks API and source connectivity, then deploys a systemd service. If the old integration was enabled, it only disables it after the new service has scraped data. Re-running on an installed v1.0 collector retains `/etc/newrelic-scylla-gate/config.json`, local snapshots, incident queue and ingest counters. On a failed upgrade, it attempts to restore the prior running Scylla Gate before exiting.
 
-**Tested:** local Python tests and mock endpoints. **Not yet tested:** actual cutover on the user's server. Review the shell script before execution. This is an experimental branch, not part of the read-only ChatGPT plugin runtime.
+The installer's API probe sends a single metric; it does not transmit license keys in output. **No automatic remote deployment** is included in this pull request.
 
-## Behavior
-
-- 30-second local scrapes saved as compressed Prometheus text snapshots; 48-hour / 1 GiB rolling retention (whichever comes first).
-- 120-second lightweight metric heartbeat to New Relic.
-- On collector errors, CQL error/timeout counter increases or large coordinator read/write latency bucket changes, upload up to ten minutes of prior snapshots and continue for fifteen minutes after last detected anomaly.
-- Explicit external triggers can be queued on the collector host.
-- Bounded local estimated uncompressed upload JSON: 60 MB/day and 500 MB/month **for this process only**.
-- Old metric type and labels may differ; check NRQL and alerts. No complete account usage enforcement.
-
-## Verify / operate
+### Verify
 
 ```bash
-sudo python3 /opt/newrelic-scylla-gate/gate.py --status
-sudo journalctl -u scylla-gate --since '30 minutes ago' --no-pager
-sudo python3 /opt/newrelic-scylla-gate/gate.py --trigger 'bot_db_timeout'
+sudo python3 /opt/newrelic-scylla-gate/gate.py --selftest
+sudo python3 /opt/newrelic-scylla-gate/gate.py --summary
+sudo systemctl is-active scylla-gate newrelic-infra
+sudo journalctl -u scylla-gate --since '10 minutes ago' --no-pager
+ls -l /etc/newrelic-infra/integrations.d/scylla-prometheus.yml*
+```
+
+On installed collectors, the separate `rollback.sh` restores the original high-ingest `nri-prometheus` integration:
+
+```bash
 sudo /opt/newrelic-scylla-gate/rollback.sh
 ```
 
-## Limitations
+### Incident behavior
 
-- The bot process cannot be automatically observed unless its own timeout/error handler calls the trigger command or exports a machine-readable signal. Scylla-side errors and latency work automatically.
-- OS CPU steal per database node must still be observed through the Infrastructure Agent, not this collector.
-- Detection of a single latency outlier is approximate: aggregated histogram buckets cannot prove a single 500 ms sample without an appropriate threshold-specific difference calculation.
-- Gate byte budget does not control other New Relic integrations. Already ingested data cannot be retracted.
-- Local storage and network load should be monitored; use SSD rather than SD card when feasible.
-- Local snapshots contain metric labels and may reveal internal paths or services. Files are root-only.
-- The installer assumes the existing integration path `/etc/newrelic-infra/integrations.d/scylla-prometheus.yml`. If not present, it exits without changes.
-- The new Metric API stream uses gauge samples instead of the old Prometheus metric types. Previously saved queries may need updating.
-- The temporary preflight sends one probe metric to the user's New Relic account.
+- Every 30 seconds, scrape ScyllaDB and save root-only compressed Prometheus snapshots locally, up to 48 hours / 1 GiB.
+- Every 120 seconds, upload only a bounded heartbeat and p95 bucket estimate, preserving critical error and reactor signals.
+- On a qualifying event, upload **10 minutes before** the incident and continue until **15 minutes after the last trigger**.
+- Typed CQL error triggers: `protocol_error` at 1 increment, `invalid` at 3 increments in 60 s, and typically recoverable `unprepared` at 10 increments in 60 s. Other error and timeout counters trigger on any increment. Counter resets establish a baseline rather than a false alert.
+- Aggregate coordinator latency cumulative histogram differences to calculate p95 upper-bucket bounds; trigger on p95 >=100ms across two sampling windows or any definitely >500ms observation in supported buckets.
+- Persistent SQLite queue retains unsent incident snapshots and incremental upload offsets across service restarts. Uploaded data is checkpointed at least once; a crash after API acceptance but before checkpoint can produce a duplicate upload. Queue entries marked `missing` or `expired` remain visible.
+- A 60 MB/day and 500 MB/month **per-gate estimated uncompressed payload** cap limits this collector's sends. When blocked, snapshots remain locally until retention / New Relic's 48-hour acceptance window expires. This is **not** the account's real billing or usage cap.
 
-New Relic docs:
-- [Metric API](https://docs.newrelic.com/docs/data-apis/ingest-apis/metric-api/report-metrics-metric-api/)
-- [48-hour timestamp window](https://docs.newrelic.com/docs/data-apis/ingest-apis/metric-api/metric-api-limits-restricted-attributes/)
+### External trigger from Bot
+
+For a Bot on the same host, call:
+
+```bash
+sudo python3 /opt/newrelic-scylla-gate/gate.py --trigger 'bot_db_timeout'
+```
+
+For a remote Bot, an authenticated, constrained notification transport must be built separately. Do not expose this collector's trigger directories or an unauthenticated HTTP endpoint to the internet.
+
+### Configuration
+
+`/etc/newrelic-scylla-gate/config.json` is preserved on upgrades. Default trigger settings added in v1.1 (and used if missing from an older config):
+
+```json
+{
+  "error_window_seconds": 60,
+  "cql_thresholds": {
+    "unprepared": 10,
+    "invalid": 3,
+    "protocol_error": 1
+  }
+}
+```
+
+Advanced `--status` prints the full internal state and detailed histograms; **`--summary`** prints a short incident/queue/budget summary.
+
+### Verification and limitations
+
+The initial collector successfully installed on 2026-11-05 and demonstrated three-node scraping, a manually queued incident, and CQL error-triggered detail sending, as reported by its operator. v1.1 changes have regression tests run in CI; a **live v1.1 upgrade has not yet been verified**.
+
+- A Metric API HTTP 202 confirms request acceptance, **not** all metrics ultimately ingested. Validate query results and `NrIntegrationError` to confirm ingestion.
+- Historic points older than 48 hours are dropped by New Relic; local retention and account monthly ingest are separate concerns.
+- A persistent budget block, upload outage, or disk cap can create `expired` / `missing` entries; the script reports rather than silently declaring them complete.
+- Histogram output as gauges changes semantics from the original `nri-prometheus` metrics. NRQL/alerts may need updating; no automatic migration of dashboard queries.
+- CPU steal per DB node remains the responsibility of the New Relic Infrastructure Agent.
+- The new queue does not actively detect user-side Bot timeouts without Bot instrumentation.
+- Source and saved snapshots may contain service/cluster labels: root-only permissions are required. Prefer SSD over microSD storage where practical.
+
+Official New Relic docs: [Metric API data format](https://docs.newrelic.com/docs/data-apis/ingest-apis/metric-api/report-metrics-metric-api/) · [48-hour and payload limits](https://docs.newrelic.com/docs/data-apis/ingest-apis/metric-api/metric-api-limits-restricted-attributes/).
