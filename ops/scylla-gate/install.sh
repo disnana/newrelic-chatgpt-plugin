@@ -10,7 +10,7 @@ CFGDIR=/etc/newrelic-scylla-gate
 DATADIR=/var/lib/newrelic-scylla-gate
 SVC=/etc/systemd/system/scylla-gate.service
 REGION="${NR_SCYLLA_REGION:-us}"
-BASE=https://raw.githubusercontent.com/disnana/newrelic-chatgpt-plugin/feature/scylla-local-gate-20261105/ops/scylla-gate
+BASE=https://raw.githubusercontent.com/disnana/newrelic-chatgpt-plugin/main/ops/scylla-gate
 SHA=fd8f0d7e31df128c80a503f39144c842a69182c44b7b505f5883fce38c7fc8a0
 ACTION="${1:-install}"
 log() { printf '[scylla-gate] %s\n' "$*"; }
