@@ -21,5 +21,7 @@ jobs:
       - run: node scripts/validate-artifact.mjs
       - run: node scripts/test-mcp.mjs
       - run: python3 scripts/test-migrations.py
+      - run: python3 -m unittest discover -s ops/scylla-gate -p 'test_*.py' -v
+      - run: bash -n ops/scylla-gate/install.sh
       - run: python3 scripts/check-distribution.py
       - run: python3 scripts/package-release.py
