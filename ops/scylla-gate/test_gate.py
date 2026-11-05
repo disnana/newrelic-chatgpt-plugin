@@ -172,14 +172,11 @@ class GateTests(unittest.TestCase):
         import re
         base = Path(__file__).parent
         installer = (base/'install.sh').read_text()
-        match = re.search(r'^SHA=([a-f0-9]{64})
-    unittest.main(verbosity=2)
-, installer, re.MULTILINE)
+        match = re.search(r'^SHA=([a-f0-9]{64})$', installer, re.MULTILINE)
         self.assertIsNotNone(match, 'installer must pin source sha256')
         actual = hashlib.sha256((base/'gate.py').read_bytes()).hexdigest()
         self.assertEqual(match.group(1), actual, 'installer will fail at runtime if controller changes')
         self.assertIn('restore_on_exit()', installer, 'upgrades need rollback on failure')
-
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
