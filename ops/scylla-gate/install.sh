@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Scylla Gate v1.0.0: upgrade the existing New Relic Scylla collector.
+# Scylla Gate v1.1.0: upgrade the existing New Relic Scylla collector.
 set -Eeuo pipefail
 umask 077
 (( EUID == 0 )) || { echo "Run as root (sudo bash)" >&2; exit 1; }
@@ -11,7 +11,7 @@ DATADIR=/var/lib/newrelic-scylla-gate
 SVC=/etc/systemd/system/scylla-gate.service
 REGION="${NR_SCYLLA_REGION:-us}"
 BASE=https://raw.githubusercontent.com/disnana/newrelic-chatgpt-plugin/feature/scylla-local-gate-20261105/ops/scylla-gate
-SHA=2fe624e3654cf37a9183d5320a5aa66163779559ea08186e10cb55428c34f910
+SHA=fd8f0d7e31df128c80a503f39144c842a69182c44b7b505f5883fce38c7fc8a0
 ACTION="${1:-install}"
 log() { printf '[scylla-gate] %s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -69,6 +69,8 @@ cfg={
  'retention_hours':48,'disk_cap_mb':1024,'daily_upload_mb':60,
  'monthly_upload_mb':500,'max_incident_batches_per_cycle':8,
  'max_heartbeat_series_per_node':200,'histogram_unit':'microseconds',
+ 'error_window_seconds':60,
+ 'cql_thresholds':{'unprepared':10,'invalid':3,'protocol_error':1},
  'p95_latency_ms':100,'single_latency_ms':500,'min_latency_samples':5,
 }
 with open(os.path.join(os.environ['TMP'],'config.json'),'w') as f:
@@ -82,6 +84,37 @@ cp -p "$ORIGINAL" "$BACKUP/scylla-prometheus.yml"
 for spec in "$APP/gate.py" "$CFGDIR/config.json" "$SVC"; do
   [[ ! -f "$spec" ]] || cp -p "$spec" "$BACKUP/$(basename "$spec")"
 done
+OLD_GATE_ACTIVE=0
+if systemctl is-active --quiet scylla-gate.service; then OLD_GATE_ACTIVE=1; fi
+CUTOVER_STARTED=0
+COMMITTED=0
+MOVED=0
+restore_on_exit() {
+  local rc=$?
+  trap - EXIT
+  if [[ "$CUTOVER_STARTED" == 1 && "$COMMITTED" != 1 ]]; then
+    echo 'Upgrade failed: restoring previous monitoring configuration' >&2
+    systemctl stop scylla-gate.service || true
+    [[ ! -f "$BACKUP/gate.py" ]] || install -m 0700 "$BACKUP/gate.py" "$APP/gate.py"
+    [[ ! -f "$BACKUP/config.json" ]] || install -m 0600 "$BACKUP/config.json" "$CFGDIR/config.json"
+    [[ ! -f "$BACKUP/scylla-gate.service" ]] || install -m 0644 "$BACKUP/scylla-gate.service" "$SVC"
+    systemctl daemon-reload || true
+    if [[ "$OLD_GATE_ACTIVE" == 1 ]]; then
+      systemctl enable scylla-gate.service || true
+      systemctl restart scylla-gate.service || true
+    else
+      systemctl disable --now scylla-gate.service || true
+    fi
+    if [[ "$MOVED" == 1 && ! -f "$SOURCE" && -f "$DISABLED" ]]; then
+      mv "$DISABLED" "$SOURCE" || true
+      systemctl restart newrelic-infra.service || true
+    fi
+  fi
+  rm -rf "$TMP"
+  exit "$rc"
+}
+trap restore_on_exit EXIT
+CUTOVER_STARTED=1
 install -m 0700 "$TMP/gate.py" "$APP/gate.py"
 if [[ ! -f "$CFGDIR/config.json" || "${NR_SCYLLA_RESET_CONFIG:-0}" == "1" ]]; then
   install -m 0600 "$TMP/config.json" "$CFGDIR/config.json"
@@ -143,21 +176,9 @@ PY
   then READY=1;break;fi
 done
 if [[ "$READY" != 1 ]]; then
-  systemctl disable --now scylla-gate.service || true
-  die 'Replacement did not collect any metrics. Original integration is still enabled'
+  die 'Replacement did not collect any metrics; restoring previous collector'
 fi
-MOVED=0
-restore_on_failure() {
-  rc=$?
-  trap - ERR
-  if [[ "$MOVED" == 1 && ! -f "$SOURCE" && -f "$DISABLED" ]]; then
-    mv "$DISABLED" "$SOURCE" || true
-    systemctl restart newrelic-infra.service || true
-  fi
-  echo 'Cutover failed; attempted to restore original integration' >&2
-  exit "$rc"
-}
-trap restore_on_failure ERR
+
 if [[ -f "$SOURCE" ]]; then
   [[ ! -e "$DISABLED" ]] || die 'Existing disabled file conflict; not overwriting it'
   mv "$SOURCE" "$DISABLED"
@@ -166,7 +187,7 @@ fi
 systemctl restart newrelic-infra.service
 systemctl is-active --quiet newrelic-infra.service
 systemctl is-active --quiet scylla-gate.service
-trap - ERR
+COMMITTED=1
 log 'Installed. Original Scylla nri-prometheus integration disabled, Infra Agent retained'
 log "Backup: $BACKUP"
 log "Status: sudo python3 $APP/gate.py --status"
