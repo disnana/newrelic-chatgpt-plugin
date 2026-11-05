@@ -110,9 +110,14 @@ def db_connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.execute('CREATE TABLE IF NOT EXISTS offsets (path TEXT PRIMARY KEY, done INTEGER NOT NULL DEFAULT 0, finished INTEGER NOT NULL DEFAULT 0)')
     conn.execute('CREATE TABLE IF NOT EXISTS bytes (period TEXT PRIMARY KEY, total INTEGER NOT NULL)')
+    # Persistent spool: an incident is not lost when it stops firing or the process restarts.
+    conn.execute("""CREATE TABLE IF NOT EXISTS incident_queue (
+        path TEXT PRIMARY KEY, snapshot_ts INTEGER NOT NULL, enqueued_at INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending', error TEXT NOT NULL DEFAULT ''
+    )""")
+    conn.execute('CREATE INDEX IF NOT EXISTS incident_queue_status_time ON incident_queue(status, snapshot_ts)')
     conn.commit()
     return conn
-
 
 def read_sample(line: str):
     if not line or line[0] == '#':
@@ -220,67 +225,107 @@ def event_signals(payload: bytes):
             continue
         name, attrs, value = obj
         if ERROR_NAME.match(name):
-            counters[name] = counters.get(name, 0) + value
+            # Do not mix protocol_error, invalid and usually recoverable UNPREPARED.
+            kind = attrs.get('type', 'unknown')
+            key = name + '|type=' + kind
+            counters[key] = counters.get(key, 0) + value
         if name in HISTOGRAMS and 'le' in attrs:
             by_name = hist.setdefault(name, {})
             bound = attrs['le']
             by_name[bound] = by_name.get(bound, 0) + value
     return counters, hist
 
+def detect(target_id: str, payload: bytes, state: dict, config: dict, now: int | None = None):
+    """Trigger on typed CQL-error deltas and correct cumulative-histogram deltas.
 
-def detect(target_id: str, payload: bytes, state: dict, config: dict):
+    A large single observation can trigger independently from the p95 threshold.
+    Restarted/decreased counters establish a new baseline, not an error event.
+    """
+    now = int(time.time()) if now is None else now
     reasons = []
     counters, hist = event_signals(payload)
-    old_counters = state['prev'].get(target_id, {})
-    for name, value in counters.items():
-        prev = old_counters.get(name)
-        if prev is not None and value > prev:
-            reasons.append(f'{target_id}: {name} +{int(value-prev)}')
+    old_counters = state.setdefault('prev', {}).get(target_id, {})
+    windows = state.setdefault('error_windows', {}).setdefault(target_id, {})
+    window_seconds = int(config.get('error_window_seconds', 60))
+    thresholds = {'unprepared': 10, 'invalid': 3, 'protocol_error': 1}
+    thresholds.update(config.get('cql_thresholds', {}))
+    for key, value in counters.items():
+        previous = old_counters.get(key)
+        delta = max(0, value - previous) if previous is not None else 0
+        recent = [(t, n) for t, n in windows.get(key, []) if now - t < window_seconds]
+        if delta > 0:
+            recent.append((now, delta))
+        windows[key] = recent[-120:]
+        kind = key.split('|type=', 1)[-1]
+        if key.startswith('scylla_transport_cql_errors_total|'):
+            minimum = max(1, int(thresholds.get(kind, 1)))
+        else:
+            # Timeouts and other error counters: a single increment is significant.
+            minimum = 1
+        window_count = sum(n for _, n in recent)
+        if delta > 0 and window_count >= minimum:
+            reasons.append(f'{target_id}: {key} +{int(delta)} ({int(window_count)} in {window_seconds}s)')
     state['prev'][target_id] = counters
 
-    old_histograms = state['hist'].get(target_id, {})
+    old_histograms = state.setdefault('hist', {}).get(target_id, {})
     for hist_name, current in hist.items():
         old_hist = old_histograms.get(hist_name, {})
         if '+Inf' not in current or '+Inf' not in old_hist:
             continue
         total = current['+Inf'] - old_hist['+Inf']
-        if total < config.get('min_latency_samples', 5):
+        if total <= 0:  # No activity, or a counter reset.
             continue
-        buckets = []
-        for key, v in current.items():
+        values = []
+        invalid = False
+        for key, value in current.items():
             if key == '+Inf':
                 continue
             try:
                 bound = float(key)
             except ValueError:
                 continue
-            delta = max(0, v - old_hist.get(key, v))
-            buckets.append((bound, delta))
-        buckets.sort()
-        for bound, delta in buckets:
-            if delta >= total * 0.95:
-                # Scylla coordinator latency histogram traditionally uses microseconds.
-                # Configurable if a deployment exposes seconds instead.
-                ms = bound / 1000 if config.get('histogram_unit', 'microseconds') == 'microseconds' else bound * 1000
-                kind = 'read' if '_read_' in hist_name else 'write'
-                state.setdefault('last_p95_ms', {}).setdefault(target_id, {})[kind] = round(ms, 3)
-                track = target_id + ':' + kind
-                if ms >= config.get('single_latency_ms', 500):
-                    reasons.append(f'{target_id}: coordinator {kind} p95 bucket >= {ms:.1f}ms')
-                elif ms >= config.get('p95_latency_ms', 100):
-                    n = state['bad_latency'].get(track, 0) + 1
-                    state['bad_latency'][track] = n
-                    if n >= 2:
-                        reasons.append(f'{target_id}: coordinator {kind} p95 bucket >= {ms:.1f}ms (2 checks)')
-                else:
-                    state['bad_latency'][track] = 0
+            if key not in old_hist or value < old_hist[key]:
+                invalid = True  # Changed buckets or mixed-shard counter reset.
                 break
+            values.append((bound, value - old_hist[key]))
+        if invalid:
+            continue
+        values.sort()
+        kind = 'read' if '_read_' in hist_name else 'write'
+        track = target_id + ':' + kind
+        unit = config.get('histogram_unit', 'microseconds')
+        to_ms = (lambda n: n / 1000.0) if unit == 'microseconds' else (lambda n: n * 1000.0)
+
+        if total >= config.get('min_latency_samples', 5):
+            # Histogram buckets are cumulative: find the first >= 95% of new observations.
+            p95_ms = None
+            for bound, cumulative_delta in values:
+                if cumulative_delta >= total * .95:
+                    p95_ms = to_ms(bound)
+                    break
+            if p95_ms is not None:
+                state.setdefault('last_p95_ms', {}).setdefault(target_id, {})[kind] = round(p95_ms, 3)
+                if p95_ms >= config.get('p95_latency_ms', 100):
+                    n = state.setdefault('bad_latency', {}).get(track, 0) + 1
+                    state['bad_latency'][track] = n
+                    if n == 2 or (n > 2 and n % 5 == 0):
+                        reasons.append(f'{target_id}: coordinator {kind} p95 bucket >= {p95_ms:.1f}ms ({n} checks)')
+                else:
+                    state.setdefault('bad_latency', {})[track] = 0
+
+        extreme_ms = float(config.get('single_latency_ms', 500))
+        # Use the first bucket ABOVE the threshold, so a tail sample is definitely > threshold.
+        upper = next(((bound, cumulative_delta) for bound, cumulative_delta in values
+                      if to_ms(bound) >= extreme_ms), None)
+        if upper is not None and total - upper[1] > 0:
+            reasons.append(f'{target_id}: coordinator {kind} >{extreme_ms:g}ms observations +{int(total - upper[1])}')
     state['hist'][target_id] = hist
     return reasons
 
-
 def api_post(metrics: list, cfg: dict, key: str, dry_run: bool = False) -> int:
     body = json.dumps([{'metrics': metrics}], separators=(',', ':'), allow_nan=False).encode('utf8')
+    if len(body) > 900_000:
+        raise RuntimeError('Metric API batch too large before compression')
     if dry_run:
         return len(body)
     req = request.Request(ENDPOINTS[cfg['region']], data=gzip.compress(body, compresslevel=3), method='POST', headers={
@@ -354,35 +399,62 @@ def snapshots_between(start: int, end: int):
     return sorted(files, key=lambda p: (p[0], p[1].name))
 
 
-def send_incident(cfg, state, conn, now: int, key: str):
-    deadline = int(state.get('pending_until', state.get('active_until', 0)))
-    if now > deadline or not state.get('incident_start'):
+def enqueue_incident(cfg, state, conn, now: int):
+    """Discover all old and future snapshots in the incident window.
+
+    Queue entries survive restarts, idle periods and the original 2-hour drain window.
+    """
+    if not state.get('incident_start'):
         return
-    t0 = int(state['incident_start']) - int(cfg['pre_seconds'])
-    # The forward window ends after the final anomaly; pending batches may drain later.
-    cutoff = min(now, int(state['active_until']))
-    instances = {t['id']: urlparse(t['url']).netloc for t in cfg['targets']}
+    start = int(state['incident_start']) - int(cfg.get('pre_seconds', 600))
+    cutoff = min(now, int(state.get('active_until', 0)))
+    if cutoff < start:
+        return
+    previous_scan = int(state.get('incident_enqueued_through', start - 1))
+    since = max(start, previous_scan - 2 * int(cfg.get('scrape_seconds', 30)))
+    rows = [('incident:' + f.name, ts, now) for ts, f in snapshots_between(since, cutoff)]
+    if rows:
+        conn.executemany('INSERT OR IGNORE INTO incident_queue(path,snapshot_ts,enqueued_at) VALUES (?,?,?)', rows)
+        conn.commit()
+    state['incident_enqueued_through'] = cutoff
+
+
+def send_incident(cfg, state, conn, now: int, key: str):
+    """Drain durable queued snapshots until complete, budget-blocked, expired or missing."""
     remaining_batches = int(cfg.get('max_incident_batches_per_cycle', 8))
-    for ts, f in snapshots_between(t0, cutoff):
-        ident = 'incident:' + f.name
-        row = conn.execute('SELECT finished FROM offsets WHERE path=?', (ident,)).fetchone()
-        if row and row[0]:
+    instances = {t['id']: urlparse(t['url']).netloc for t in cfg['targets']}
+    for ident, ts in conn.execute("""SELECT path,snapshot_ts FROM incident_queue
+                                    WHERE status='pending' ORDER BY snapshot_ts,path""").fetchall():
+        if now - ts >= 47 * 3600:  # Keep distance from Metric API's 48h cutoff.
+            conn.execute("UPDATE incident_queue SET status='expired',error='New Relic 48h ingestion window' WHERE path=?", (ident,))
+            conn.commit()
+            print(f'WARNING incident snapshot expired before upload: {ident}', flush=True)
             continue
-        tid = f.name.split('-')[1]
+        filename = ident.removeprefix('incident:')
+        f = SNAPSHOTS / filename
+        if not f.exists():
+            conn.execute("UPDATE incident_queue SET status='missing',error='local snapshot pruned or removed' WHERE path=?", (ident,))
+            conn.commit()
+            print(f'WARNING incident snapshot missing: {ident}', flush=True)
+            continue
+        tid = filename.split('-')[1]
         try:
             payload = gzip.decompress(f.read_bytes())
             metrics = aggregated_metrics(payload, instances.get(tid, tid), 'incident', ts)
             count, complete = send_chunks(metrics, cfg, conn, ident=ident,
                                           now=now, key=key, max_batches=remaining_batches)
             remaining_batches -= count
+            if complete:
+                conn.execute("UPDATE incident_queue SET status='finished',error='' WHERE path=?", (ident,))
+                conn.commit()
             if not complete or remaining_batches <= 0:
+                state['last_upload_error'] = ''
                 return
         except Exception as exc:
             state['last_upload_error'] = str(exc)[:180]
             print(f'WARNING incident upload deferred: {type(exc).__name__}: {str(exc)[:120]}', flush=True)
             return
     state['last_upload_error'] = ''
-
 
 def heartbeat(cfg, state, conn, now, key, samples):
     if now - int(state.get('last_heartbeat', 0)) < int(cfg['heartbeat_seconds']):
@@ -396,6 +468,7 @@ def heartbeat(cfg, state, conn, now, key, samples):
                             'type': 'gauge', 'value': p95, 'timestamp': ts * 1000,
                             'attributes': {'instance': instance, 'telemetry.pipeline': 'scylla-gate'}})
         # A single heartbeat should be bounded even if a future metric adds labels.
+        metrics = metrics[-2:] + metrics[:-2] if state.get('last_p95_ms', {}).get(tid) else metrics
         metrics = metrics[:int(cfg.get('max_heartbeat_series_per_node', 200))]
         try:
             send_chunks(metrics, cfg, conn, ident=f'heartbeat:{tid}:{ts}', now=now, key=key)
@@ -424,6 +497,7 @@ def activate(state, now, reasons, cfg):
         return
     if now > int(state.get('active_until', 0)):
         state['incident_start'] = now
+        state['incident_enqueued_through'] = 0
         state['incident_id'] = str(uuid.uuid4())[:12]
     state['active_until'] = now + int(cfg['post_seconds'])
     state['pending_until'] = state['active_until'] + int(cfg.get('drain_seconds', 7200))
@@ -452,6 +526,8 @@ def prune(cfg, now):
 
 def run_once(cfg, state, conn, key):
     now = int(time.time())
+    # Capture old incident history before a new trigger resets its incident_start.
+    enqueue_incident(cfg, state, conn, now)
     check_triggers(state, now, cfg)
     samples = {}
     reasons = []
@@ -463,12 +539,12 @@ def run_once(cfg, state, conn, key):
             continue
         take_snapshot(t, payload, now)
         samples[t['id']] = (now, payload)
-        reasons += detect(t['id'], payload, state, cfg)
+        reasons += detect(t['id'], payload, state, cfg, now=now)
     activate(state, now, reasons, cfg)
     state['last_scrape'] = now
     state['last_successes'] = len(samples)
+    enqueue_incident(cfg, state, conn, now)
     prune(cfg, now)
-    # Checkpoint before network I/O: a restart cannot lose the detected incident.
     atomic_json(STATE_PATH, state)
     heartbeat(cfg, state, conn, now, key, samples)
     send_incident(cfg, state, conn, now, key)
@@ -476,7 +552,6 @@ def run_once(cfg, state, conn, key):
     if not samples:
         print('WARNING all targets unreachable (saved previous local history)', flush=True)
     return len(samples)
-
 
 def probe(cfg):
     key = license_key()
@@ -517,19 +592,24 @@ def main():
     ap.add_argument('--probe', action='store_true')
     ap.add_argument('--once', action='store_true')
     ap.add_argument('--status', action='store_true')
+    ap.add_argument('--summary', action='store_true')
     ap.add_argument('--trigger', metavar='REASON')
     args = ap.parse_args()
     if args.selftest:
         selftest(); return
     if args.trigger:
         cmd_trigger(args.trigger); return
-    if args.status:
+    if args.status or args.summary:
         s = read_state()
         s['budget_utc'] = {}
         if DB_PATH.exists():
             conn = db_connect()
             day, month = usage(conn, int(time.time()))
+            s['queue'] = dict(conn.execute('SELECT status,COUNT(*) FROM incident_queue GROUP BY status').fetchall())
             s['budget_utc'] = {'day_uncompressed_mb':round(day/1000000,3), 'month_uncompressed_mb':round(month/1000000,3)}
+        if args.summary:
+            fields = ('incident_id','incident_start','active_until','last_reason','last_scrape','last_successes','last_upload_error','last_p95_ms','queue','budget_utc')
+            s = {k:s.get(k) for k in fields}
         print(json.dumps(s, ensure_ascii=False, indent=2)); return
     cfg = load_config()
     if args.probe:
