@@ -47,7 +47,7 @@ function plain(value) {
 /** @typedef {{subject: string, csrfContext?: unknown, sessionId?: string}} GatewayPrincipal */
 /** @typedef {{url: string, method: string, cookie: string, origin: string|null, secFetchSite: string|null, secFetchMode: string|null, secFetchDest: string|null, csrfToken: string|null}} BrowserAuthContext */
 /** @typedef {{url: string, method: string, authorization: string}} McpAuthContext */
-/** @typedef {{externalOrigin: string, issuer: string, audience: string, keyId: string, allowedSubjects: string[], signingKey: CryptoKey, authenticateBrowser: (context: BrowserAuthContext) => GatewayPrincipal|null|Promise<GatewayPrincipal|null>, authenticateMcp: (context: McpAuthContext) => GatewayPrincipal|null|Promise<GatewayPrincipal|null>, verifyBrowserCsrf: (context: {request: BrowserAuthContext, subject: string, context: unknown, path: string}) => boolean|Promise<boolean>, backend: {fetch: (request: Request) => Promise<Response>}, now?: () => number}} GatewayOptions */
+/** @typedef {{externalOrigin: string, issuer: string, audience: string, keyId: string, allowedSubjects: string[], signingKey: CryptoKey, authenticateBrowser: (context: BrowserAuthContext) => GatewayPrincipal|null|Promise<GatewayPrincipal|null>, authenticateMcp: (context: McpAuthContext) => GatewayPrincipal|null|Promise<GatewayPrincipal|null>, verifyBrowserCsrf: (context: {request: BrowserAuthContext, subject: string, context: unknown, path: string}) => boolean|Promise<boolean>, backend: {fetch: (request: Request) => Promise<Response>}, browserLogin?: {fetch: (request: Request) => Response|Promise<Response>}, now?: () => number}} GatewayOptions */
 
 /** @param {unknown} value @returns {value is GatewayPrincipal} */
 function validPrincipal(value) {
@@ -319,6 +319,7 @@ export function createSelfHostGateway(options = {}) {
   const authenticateMcp = options.authenticateMcp;
   const verifyBrowserCsrf = options.verifyBrowserCsrf;
   const backend = options.backend;
+  const browserLogin = options.browserLogin;
   const signingKey = options.signingKey;
   const issuer = options.issuer;
   const audience = options.audience;
@@ -334,7 +335,8 @@ export function createSelfHostGateway(options = {}) {
     || typeof audience !== "string" || !audience || audience.length > 256
     || /[\u0000-\u001f\u007f]/.test(audience)
     || typeof kid !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(kid)
-    || !externalOrigin || !subjects) {
+    || !externalOrigin || !subjects
+    || browserLogin !== undefined && (!browserLogin || typeof browserLogin.fetch !== "function")) {
     throw new TypeError("Self-host gateway needs trusted browser/MCP auth adapters, CSRF verification, an isolated backend, an RS256 key, and valid issuer/audience/origin/subjects.");
   }
   const now = typeof options.now === "function" ? options.now : () => Date.now();
@@ -348,6 +350,25 @@ export function createSelfHostGateway(options = {}) {
       if (url.protocol !== "https:" || url.origin !== externalOrigin) return errorResponse(421, "Unexpected host.");
       if (url.username || url.password || url.hash) return errorResponse(400, "Invalid request URL.");
 
+      // Optional OIDC login routes terminate at the gateway. They are never
+      // forwarded to the New Relic Worker, and cookies are returned only from
+      // this configured identity adapter.
+      if (["/login", "/auth/start", "/auth/callback", "/auth/complete", "/auth/logout"].includes(url.pathname)) {
+        if (!browserLogin) return errorResponse(404, "Not found.");
+        const allowedMethod = url.pathname === "/auth/logout" ? "POST" : "GET";
+        if (request.method !== allowedMethod) return errorResponse(405, "Method not allowed.", { allow: allowedMethod });
+        const bodyResult = await readBody(request, 0);
+        if (bodyResult.tooLarge || bodyResult.body !== null && bodyResult.body.byteLength > 0) {
+          return errorResponse(413, "Request body is not allowed.");
+        }
+        try {
+          const response = await browserLogin.fetch(request);
+          return response instanceof Response ? response : errorResponse(502, "Authentication service is unavailable.");
+        } catch {
+          return errorResponse(503, "Authentication service is unavailable.");
+        }
+      }
+
       const route = ROUTES.get(url.pathname);
       if (!route) return errorResponse(404, "Not found.");
       if (!route.methods.includes(request.method)) {
@@ -360,7 +381,15 @@ export function createSelfHostGateway(options = {}) {
       if (route.kind === "mcp") {
         if (!requestOriginIsSafe(request, externalOrigin)) return jsonError(403, "origin_not_allowed");
       } else {
-        const safeLanding = !route.csrf && ["/", "/health", "/oauth/complete"].includes(url.pathname);
+        const crossSiteRootNavigation = browserLogin && url.pathname === "/" && request.method === "GET"
+          && request.headers.get("sec-fetch-site") === "cross-site"
+          && request.headers.get("sec-fetch-mode") === "navigate"
+          && request.headers.get("sec-fetch-dest") === "document";
+        if (crossSiteRootNavigation) {
+          return new Response(null, { status: 303, headers: noStoreHeaders({ location: externalOrigin + "/login" }) });
+        }
+        const safeLanding = !route.csrf && (["/health", "/oauth/complete"].includes(url.pathname)
+          || !browserLogin && url.pathname === "/");
         if (!requestOriginIsSafe(request, externalOrigin, safeLanding)) return errorResponse(403, "Origin is not allowed.");
       }
 
@@ -372,6 +401,12 @@ export function createSelfHostGateway(options = {}) {
         principal = null;
       }
       if (!validPrincipal(principal) || !subjects.has(principal.subject)) {
+        if (browserLogin && route.kind === "browser" && url.pathname === "/" && request.method === "GET") {
+          return new Response(null, {
+            status: 303,
+            headers: noStoreHeaders({ location: externalOrigin + "/login" }),
+          });
+        }
         return route.kind === "mcp" ? jsonError(401, "authentication_required") : errorResponse(401, "Authentication required.");
       }
       if (route.sessionBinding && (typeof principal.sessionId !== "string"

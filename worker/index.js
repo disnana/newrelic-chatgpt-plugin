@@ -1157,7 +1157,11 @@ async function handleApi(request, env, pathname) {
   return jsonResponse({ error: "Not found" }, 404);
 }
 
-function pageResponse(content = page) {
+function pageResponse(content = page, showGatewaySession = false) {
+  if (content === page && showGatewaySession) {
+    content = content.replace('id="gateway-session" class="card" aria-labelledby="gateway-session-title" hidden',
+      'id="gateway-session" class="card" aria-labelledby="gateway-session-title" data-logout-enabled="true"');
+  }
   return new Response(content, {
     headers: {
       "content-type": "text/html; charset=utf-8",
@@ -1261,6 +1265,7 @@ export default {
     if (request.method !== "GET") {
       return new Response("Method not allowed", { status: 405, headers: { allow: "GET" } });
     }
-    return pageResponse();
+    return pageResponse(page, authenticationMode(env) === "signed_proxy"
+      && env.NEW_RELIC_AUTH_GATEWAY_LOGOUT_ENABLED === "true");
   },
 };

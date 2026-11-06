@@ -69,12 +69,13 @@ function collectText(element) {
 }
 
 async function mountPage({ capabilityData, proposalData, approvalEnabled = true, approveOutcomeUncertain = false,
-  csrfCookie = "" }) {
+  csrfCookie = "", logoutEnabled = false }) {
   const elements = new Map();
   const document = {
     cookie: csrfCookie,
     querySelector(selector) {
       if (!elements.has(selector)) elements.set(selector, new FakeElement());
+      if (selector === "#gateway-session") elements.get(selector).dataset.logoutEnabled = logoutEnabled ? "true" : "";
       return elements.get(selector);
     },
     createElement(tag) { return new FakeElement(tag); },
@@ -118,11 +119,13 @@ async function mountPage({ capabilityData, proposalData, approvalEnabled = true,
       }) };
     }
     if (path === "/api/operation-approvals/cancel") return { ok: true, status: 200, json: async () => ({ status: "cancelled" }) };
+    if (path === "/auth/logout") return { ok: true, status: 200, json: async () => ({ signedOut: true, newRelicConnectionPreserved: true }) };
     throw new Error("Unexpected endpoint: " + path);
   };
+  const navigation = [];
   const context = {
     document,
-    window: { location: { href: "https://monitor.example.test/" } },
+    window: { location: { href: "https://monitor.example.test/", assign: path => navigation.push(path) } },
     fetch: fakeFetch,
     URL,
     Date,
@@ -131,7 +134,7 @@ async function mountPage({ capabilityData, proposalData, approvalEnabled = true,
   runInNewContext(script, context, { timeout: 1000 });
   await new Promise(resolve => setImmediate(resolve));
   await new Promise(resolve => setImmediate(resolve));
-  return { elements, calls, csrfToken, approvalNonce, fakeFetch };
+  return { elements, calls, csrfToken, approvalNonce, fakeFetch, navigation };
 }
 
 const catalogPage = await mountPage({
@@ -321,3 +324,23 @@ await uncertainApprove.click();
 assert.equal(uncertainPage.calls.filter(call => call.path === "/api/operation-approvals/approve").length, approveAttemptsBeforeRetry,
   "an uncertain approval is not replayed from the browser");
 console.log("PASS uncertain approval responses disable the action and prevent browser replay");
+
+const logoutPage = await mountPage({
+  capabilityData: { pages: [], details: {} },
+  proposalData: { enabled: false, items: [] },
+  logoutEnabled: true,
+  csrfCookie: "__Host-nr-gateway-csrf=" + "S".repeat(43),
+});
+assert.equal(logoutPage.elements.get("#gateway-session").hidden, false);
+assert.equal(logoutPage.calls.some(call => call.path === "/auth/logout"), false,
+  "the gateway session is not revoked until the user clicks sign out");
+await logoutPage.elements.get("#gateway-logout").click();
+const logoutCall = logoutPage.calls.find(call => call.path === "/auth/logout");
+assert.equal(logoutCall.options.method, "POST");
+assert.equal(logoutCall.options.headers["x-csrf-token"], "S".repeat(43),
+  "logout sends the same-origin CSRF cookie in a header");
+assert.deepEqual(logoutPage.navigation, ["/login"]);
+assert.match(logoutPage.elements.get("#gateway-logout-status").textContent, /保存済みのNew Relic接続は維持/);
+assert.equal(logoutPage.calls.some(call => call.path === "/api/disconnect"), false,
+  "gateway sign-out does not disconnect the New Relic OAuth connection");
+console.log("PASS explicit, CSRF-protected, session-only self-host logout");

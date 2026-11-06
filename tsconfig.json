@@ -19,7 +19,8 @@
     "worker/operation-approval.js",
     "worker/nrql.js",
     "examples/self-host-gateway/gateway.mjs",
-    "examples/self-host-gateway/browser-session.mjs"
+    "examples/self-host-gateway/browser-session.mjs",
+    "examples/self-host-gateway/oidc-login.mjs"
   ],
   "exclude": ["dist", "node_modules"]
 }

@@ -155,6 +155,15 @@
         <ul id="approval-list" class="result-list" aria-label="保留中の変更提案"></ul>
       </section>
 
+      <section id="gateway-session" class="card" aria-labelledby="gateway-session-title" hidden>
+        <h2 id="gateway-session-title">セルフホストのログイン</h2>
+        <p>ログアウトすると、このブラウザーのゲートウェイセッションだけを終了します。保存済みのNew Relic接続は解除しません。</p>
+        <div class="actions">
+          <button id="gateway-logout" type="button" class="secondary">このブラウザーからログアウト</button>
+        </div>
+        <p id="gateway-logout-status" class="hint" role="status" aria-live="polite"></p>
+      </section>
+
       <p class="note"><strong>使い方：</strong>接続とアカウント選択の後は、iPhone版ChatGPTの通常チャットで「ScyllaDBの直近30分を調べて」のように頼めます。アカウントIDやNRQLを毎回入力する必要はありません。</p>
       <p class="note"><strong>利用量：</strong>Core ComputeとAdvanced Computeは別カテゴリです。通常の読み取りはCoreの許可だけで使えます。New RelicのAI分析にはAdvanced Compute用の許可が別に必要です。これは課金方法や利用権の判定ではありません。</p>
       <footer>ChatGPT Sites MCP · New Relic公式MCPを読み取り専用で利用 · ログやチャットへOAuthトークンを出力しません</footer>
@@ -184,6 +193,10 @@
       const approvalButton = document.querySelector("#load-approvals");
       const approvalStatus = document.querySelector("#approval-status");
       const approvalList = document.querySelector("#approval-list");
+      const gatewaySessionSection = document.querySelector("#gateway-session");
+      const gatewayLogoutButton = document.querySelector("#gateway-logout");
+      const gatewayLogoutStatus = document.querySelector("#gateway-logout-status");
+      gatewaySessionSection.hidden = gatewaySessionSection.dataset.logoutEnabled !== "true";
       let usageConsentState = null;
       let approvalCsrfToken = null;
       let catalogRequestInFlight = false;
@@ -661,6 +674,20 @@
       catalogButton.addEventListener("click", () => loadCapabilities(false));
       loadMoreCapabilitiesButton.addEventListener("click", () => loadCapabilities(true));
       approvalButton.addEventListener("click", loadApprovals);
+      gatewayLogoutButton.addEventListener("click", async () => {
+        gatewayLogoutButton.disabled = true;
+        gatewayLogoutStatus.textContent = "ログアウトしています…";
+        try {
+          const result = await api("/auth/logout", { method: "POST" });
+          if (result.signedOut !== true) throw new Error("ログアウトを確認できませんでした。");
+          gatewayLogoutStatus.textContent = "ログアウトしました。保存済みのNew Relic接続は維持されています。";
+          window.location.assign("/login");
+        } catch (error) {
+          gatewayLogoutStatus.textContent = formatError(error);
+          gatewayLogoutStatus.classList.add("error");
+          gatewayLogoutButton.disabled = false;
+        }
+      });
       usageForm.addEventListener("submit", async (event) => {
         event.preventDefault();
         saveUsageConsentButton.disabled = true;
