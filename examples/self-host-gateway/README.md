@@ -1,8 +1,32 @@
 # Self-host gateway reference (v0.4.0)
 
-This is a **gateway boundary example**, not a complete self-host login product. It does not include an identity provider, browser login/logout/session store, OAuth authorization server for MCP clients, user provisioning, subject mapping, key rotation service, or deployment configuration. Use it only as a code reference after selecting and independently reviewing those pieces.
+This is a **gateway boundary example**, not a complete self-host login product. It includes an optional D1-backed browser session/CSRF adapter, but no identity provider, login/callback/logout routes, OAuth authorization server for MCP clients, user provisioning, subject mapping, key rotation service, or deployment configuration. Use it only after selecting and independently reviewing those pieces.
 
 The reference authenticates browser and MCP requests through two separate operator-supplied adapters, runs a separate CSRF verifier for browser routes with side effects, signs a short-lived RS256 assertion, and forwards to an operator-configured private application service. It never discovers a backend URL from a request. Missing or invalid adapters, key material, issuer, audience, origin, or subject list prevent the handler from being constructed.
+
+## Optional browser session adapter
+
+`browser-session.mjs` supplies the gateway's `authenticateBrowser` and `verifyBrowserCsrf` callbacks after a trusted operator login callback has established the identity. It does **not** authenticate an OIDC response, start a login flow, or expose a route that accepts an arbitrary subject. Apply `0001_browser_sessions.sql` only to a private gateway `AUTH_DB`; it is separate from the New Relic app's six migrations and must never be applied to the production Site database.
+
+```js
+import { createD1BrowserSessionAdapter } from "./browser-session.mjs";
+
+const browserSessions = createD1BrowserSessionAdapter({
+  db: env.AUTH_DB,
+  externalOrigin: "https://monitor.example.com",
+});
+
+const gateway = createSelfHostGateway({
+  // Keep the existing private gateway options and the separate MCP adapter.
+  authenticateBrowser: browserSessions.authenticateBrowser,
+  verifyBrowserCsrf: browserSessions.verifyBrowserCsrf,
+  // ...
+});
+```
+
+Only after an operator-selected identity provider has fully verified its callback, issuer, audience, signature, state, nonce and PKCE should that trusted callback call `createBrowserSession({ subject: stableIssuerAndSubjectMapping })`. Return both values in `setCookieHeaders` as separate `Set-Cookie` response headers over HTTPS; never log or place them in URLs. The session cookie is `Secure`, `HttpOnly`, `__Host-`, `SameSite=Lax`; the independent readable CSRF cookie is `Secure`, `__Host-`, and `SameSite=Strict`. The browser pages copy the CSRF cookie into `x-csrf-token` on same-origin API fetches, including the localhost-paste New Relic OAuth completion form. `/oauth/start` is accepted only as a same-origin top-level document navigation with Fetch Metadata; missing required evidence fails closed. The adapter rejects cross-site navigation to `/oauth/callback`; the localhost-paste flow is the supported New Relic callback path, while a direct callback needs a separate provider-state-bound handler and is not implemented. Use `revokeBrowserSession` from a separately protected logout route, clear both cookies, and call `purgeExpiredSessions` from an operator-configured retention job if desired. Each cleanup call deletes at most 100 rows across revoked and expired sessions. No cleanup schedule is installed by this example.
+
+The module stores only hashes of the session cookie and CSRF token. Its random stable `sessionId` is distinct from the cookie and is signed into browser-only approval assertions; a fresh login rotates it. The store keeps the stable mapped subject for authorization. The login route, provider-specific callback validation, subject allowlist, browser redirects, external client secrets, `AUTH_DB` binding and logout CSRF enforcement remain operator inputs and require deployment-specific review.
 
 ## Integration contract
 

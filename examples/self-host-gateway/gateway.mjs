@@ -45,7 +45,7 @@ function plain(value) {
 }
 
 /** @typedef {{subject: string, csrfContext?: unknown, sessionId?: string}} GatewayPrincipal */
-/** @typedef {{url: string, method: string, cookie: string, origin: string|null, secFetchSite: string|null, secFetchMode: string|null, csrfToken: string|null}} BrowserAuthContext */
+/** @typedef {{url: string, method: string, cookie: string, origin: string|null, secFetchSite: string|null, secFetchMode: string|null, secFetchDest: string|null, csrfToken: string|null}} BrowserAuthContext */
 /** @typedef {{url: string, method: string, authorization: string}} McpAuthContext */
 /** @typedef {{externalOrigin: string, issuer: string, audience: string, keyId: string, allowedSubjects: string[], signingKey: CryptoKey, authenticateBrowser: (context: BrowserAuthContext) => GatewayPrincipal|null|Promise<GatewayPrincipal|null>, authenticateMcp: (context: McpAuthContext) => GatewayPrincipal|null|Promise<GatewayPrincipal|null>, verifyBrowserCsrf: (context: {request: BrowserAuthContext, subject: string, context: unknown, path: string}) => boolean|Promise<boolean>, backend: {fetch: (request: Request) => Promise<Response>}, now?: () => number}} GatewayOptions */
 
@@ -179,6 +179,7 @@ function authMetadata(request, kind) {
     origin: request.headers.get("origin"),
     secFetchSite: request.headers.get("sec-fetch-site"),
     secFetchMode: request.headers.get("sec-fetch-mode"),
+    secFetchDest: request.headers.get("sec-fetch-dest"),
     csrfToken: request.headers.get("x-csrf-token"),
   });
 }

@@ -18,7 +18,8 @@
     "worker/usage-consent.js",
     "worker/operation-approval.js",
     "worker/nrql.js",
-    "examples/self-host-gateway/gateway.mjs"
+    "examples/self-host-gateway/gateway.mjs",
+    "examples/self-host-gateway/browser-session.mjs"
   ],
   "exclude": ["dist", "node_modules"]
 }

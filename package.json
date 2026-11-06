@@ -5,11 +5,11 @@
   "scripts": {
     "build": "bash scripts/build.sh",
     "validate": "node scripts/validate-artifact.mjs",
-    "test": "node scripts/test-mcp.mjs && node scripts/test-oauth-v040.mjs && node scripts/test-mcp-policy.mjs && node scripts/test-self-host-gateway.mjs && node scripts/test-operation-approval.mjs && node scripts/test-operation-approval-ui.mjs && node scripts/test-operation-approval-store.mjs && node scripts/test-site-ui.mjs",
+    "test": "node scripts/test-mcp.mjs && node scripts/test-oauth-v040.mjs && node scripts/test-mcp-policy.mjs && node scripts/test-self-host-gateway.mjs && node scripts/test-self-host-sessions.mjs && node scripts/test-operation-approval.mjs && node scripts/test-operation-approval-ui.mjs && node scripts/test-operation-approval-store.mjs && node scripts/test-site-ui.mjs",
     "check": "python3 scripts/check-distribution.py",
     "typecheck": "tsc --project tsconfig.json",
     "package": "python3 scripts/package-release.py",
-    "lint": "node --check worker/index.js && node --check worker/newrelic.js && node --check worker/mcp-policy.js && node --check worker/usage-consent.js && node --check worker/operation-approval.js && node --check worker/nrql.js && node --check examples/self-host-gateway/gateway.mjs && node --check examples/operation-approval/rehearsal.mjs && node --check examples/operation-approval/demo.mjs && node --check scripts/test-self-host-gateway.mjs && node --check scripts/test-operation-approval.mjs && node --check scripts/test-operation-approval-ui.mjs && node --check scripts/test-operation-approval-store.mjs && node --check scripts/test-site-ui.mjs"
+    "lint": "node --check worker/index.js && node --check worker/newrelic.js && node --check worker/mcp-policy.js && node --check worker/usage-consent.js && node --check worker/operation-approval.js && node --check worker/nrql.js && node --check examples/self-host-gateway/gateway.mjs && node --check examples/self-host-gateway/browser-session.mjs && node --check examples/operation-approval/rehearsal.mjs && node --check examples/operation-approval/demo.mjs && node --check scripts/test-self-host-gateway.mjs && node --check scripts/test-self-host-sessions.mjs && node --check scripts/test-operation-approval.mjs && node --check scripts/test-operation-approval-ui.mjs && node --check scripts/test-operation-approval-store.mjs && node --check scripts/test-site-ui.mjs"
   },
   "version": "0.4.0",
   "license": "MIT",

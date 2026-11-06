@@ -23,3 +23,4 @@
 - Add a user-triggered Site view of the live official tool catalog; it performs only MCP initialization/tools/list and renders policy summaries as text
 - Add a browser-only proposal review/one-time approval UI backed by existing session/CSRF endpoints; no proposal creation, MCP write tool or provider dispatch is enabled
 - Add an optional bounded D1 retention cleanup handler (24-hour session/claim windows, 30-day terminal proposal retention), with a separate default-off flag and no configured cron trigger
+- Add a provider-neutral D1 browser-session and CSRF adapter for the self-host gateway; identity login, IdP callbacks, MCP OAuth and deployment configuration remain operator-supplied

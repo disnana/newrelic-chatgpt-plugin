@@ -68,9 +68,11 @@ function collectText(element) {
   return [element.textContent, ...element.children.map(collectText)].filter(Boolean).join(" ");
 }
 
-async function mountPage({ capabilityData, proposalData, approvalEnabled = true, approveOutcomeUncertain = false }) {
+async function mountPage({ capabilityData, proposalData, approvalEnabled = true, approveOutcomeUncertain = false,
+  csrfCookie = "" }) {
   const elements = new Map();
   const document = {
+    cookie: csrfCookie,
     querySelector(selector) {
       if (!elements.has(selector)) elements.set(selector, new FakeElement());
       return elements.get(selector);
@@ -129,6 +131,7 @@ const catalogPage = await mountPage({
     { name: "unsafe_write", operation: "write", billing: "unknown", available: false, reason: "operation_approval_not_implemented", description: "Provider prose must not be rendered." },
   ], truncated: false },
   proposalData: { enabled: true, items: [] },
+  csrfCookie: "__Host-nr-gateway-csrf=" + "S".repeat(43),
 });
 const catalogButton = catalogPage.elements.get("#load-capabilities");
 assert.equal(catalogButton.disabled, false, "the catalog button is available only after local status says the connection is ready");
@@ -144,7 +147,49 @@ assert.match(catalogText, /usage_consent_required/);
 assert.doesNotMatch(catalogText, /prompt injection|Provider prose|<script>/,
   "untrusted provider descriptions are never inserted into the DOM");
 assert.equal(catalogPage.calls.find(call => call.path === "/api/capabilities").options.credentials, "same-origin");
+assert.equal(catalogPage.calls.find(call => call.path === "/api/capabilities").options.headers["x-csrf-token"], "S".repeat(43),
+  "a self-host CSRF cookie is attached as a same-origin request header, never placed in the URL");
 console.log("PASS explicit tools/list-only capability retrieval; no telemetry query and provider descriptions stay hidden");
+
+const completionHtml = await readFile(new URL("../worker/oauth-complete.html", import.meta.url), "utf8");
+const completionScript = completionHtml.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+assert.ok(completionScript, "the localhost-paste completion page must contain its controller");
+async function runCompletionPage(cookie) {
+  const completionElements = new Map();
+  const document = {
+    cookie,
+    querySelector(selector) {
+      if (!completionElements.has(selector)) completionElements.set(selector, new FakeElement());
+      return completionElements.get(selector);
+    },
+  };
+  let call = null;
+  let replacedWith = null;
+  const context = {
+    document,
+    fetch: async (path, options) => {
+      call = { path, options };
+      return { ok: true, status: 200, json: async () => ({ ok: true }) };
+    },
+    setTimeout(callback) { callback(); },
+    location: { replace(path) { replacedWith = path; } },
+  };
+  runInNewContext(completionScript, context, { timeout: 1000 });
+  const form = completionElements.get("#complete-form");
+  completionElements.get("#callback-url").value = "http://localhost:12345/callback?code=synthetic&state=synthetic";
+  await form.listeners.get("submit")[0]({ preventDefault() {} });
+  return { call, replacedWith };
+}
+const selfHostCompletion = await runCompletionPage("__Host-nr-gateway-csrf=" + "K".repeat(43));
+assert.equal(selfHostCompletion.call.path, "/api/oauth/manual-complete");
+assert.equal(selfHostCompletion.call.options.headers["x-csrf-token"], "K".repeat(43),
+  "the localhost-paste page includes the self-host CSRF header without putting it in the URL or body");
+assert.doesNotMatch(selfHostCompletion.call.options.body, /K{43}/);
+assert.equal(selfHostCompletion.replacedWith, "/");
+const sitesCompletion = await runCompletionPage("");
+assert.equal(sitesCompletion.call.options.headers["x-csrf-token"], undefined,
+  "the existing Sites flow remains unchanged when no self-host CSRF cookie exists");
+console.log("PASS self-host CSRF header also protects the localhost OAuth completion form");
 
 const approvalPage = await mountPage({
   capabilityData: { tools: [] },

@@ -193,7 +193,18 @@
       }
 
       async function api(path, options) {
-        const response = await fetch(path, Object.assign({ cache: "no-store", credentials: "same-origin" }, options || {}));
+        const requestOptions = Object.assign({ cache: "no-store", credentials: "same-origin" }, options || {});
+        const headers = Object.assign({}, requestOptions.headers || {});
+        const csrfCookies = typeof document.cookie === "string" ? document.cookie.split(";").map(part => {
+          const separator = part.indexOf("=");
+          return separator >= 0 && part.slice(0, separator).trim() === "__Host-nr-gateway-csrf"
+            ? part.slice(separator + 1).trim() : null;
+        }).filter(Boolean) : [];
+        if (csrfCookies.length === 1 && /^[A-Za-z0-9_-]{43}$/.test(csrfCookies[0])) {
+          headers["x-csrf-token"] = csrfCookies[0];
+        }
+        requestOptions.headers = headers;
+        const response = await fetch(path, requestOptions);
         const data = await response.json();
         if (!response.ok) {
           const error = new Error(data.error || "リクエストに失敗しました。");
