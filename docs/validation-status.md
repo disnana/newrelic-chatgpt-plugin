@@ -26,5 +26,6 @@ The documentation inventory contains 41 tool names, but the authenticated accoun
 - Write/destructive approval workflow is not implemented, and those operations remain disabled.
 - An operation approval design is documented, but it is not an implementation or authorization to enable writes.
 - Connection status surfaces now inspect local D1 metadata only and do not refresh tokens or contact New Relic. A token refresh is attempted only when an explicit New Relic-backed operation runs; the exact live OAuth failure code remains unknown.
+- The connection page labels saved credentials as unverified and keeps an explicit reconnect action available without first deleting them. Explicitly blank or invalid self-host auth mode configuration fails closed instead of falling back to Sites identity.
 - Preview, account entitlements and per-account Core/Advanced Compute pricing were not verified.
 - No production deployment or formal Release is included. `VERSION` remains 0.4.0 for the draft PR; merging a version change to main can trigger the existing Release workflow.

@@ -89,6 +89,7 @@
           </div>
           <p id="account-hint" class="hint"></p>
           <div class="actions">
+            <a id="reconnect-link" class="button secondary" href="/oauth/start?region=us" target="_blank" rel="noopener noreferrer">New Relicに再接続</a>
             <button id="refresh" type="button" class="secondary">状態を再確認</button>
             <button id="disconnect" type="button" class="secondary">接続を解除</button>
           </div>
@@ -110,6 +111,7 @@
       const accountHint = document.querySelector("#account-hint");
       const connectionDetail = document.querySelector("#connection-detail");
       const connectLink = document.querySelector("#connect-link");
+      const reconnectLink = document.querySelector("#reconnect-link");
       const loadAccountsButton = document.querySelector("#load-accounts");
       const selectAccountButton = document.querySelector("#select-account");
 
@@ -192,10 +194,13 @@
             connectedPanel.hidden = false;
             return;
           }
-          setStatus("connected", "New Relic接続済み");
+          setStatus("connected", "New Relic接続情報を保存済み（有効性未確認）");
           const date = state.connectedAt ? new Date(state.connectedAt).toLocaleString("ja-JP") : "";
-          connectionDetail.textContent = "接続日時: " + (date || "不明") + " · リージョン: " + state.region.toUpperCase()
+          const region = ["us", "eu", "jp"].includes(state.region) ? state.region : "us";
+          connectionDetail.textContent = "保存日時: " + (date || "不明") + " · リージョン: " + region.toUpperCase()
+            + " · New Relicでのトークン有効性・到達性は未確認"
             + (state.tokenRefreshDue ? " · 次のNew Relic操作でトークン更新が必要になる可能性があります" : "");
+          reconnectLink.href = "/oauth/start?region=" + encodeURIComponent(region);
           connectedPanel.hidden = false;
           if (state.meteredReadsEnabled) {
             accountControls.hidden = false;
@@ -217,6 +222,7 @@
 
       document.querySelector("#region").addEventListener("change", (event) => {
         connectLink.href = "/oauth/start?region=" + encodeURIComponent(event.target.value);
+        reconnectLink.href = connectLink.href;
       });
       document.querySelector("#refresh").addEventListener("click", refresh);
       loadAccountsButton.addEventListener("click", () => loadAccounts());

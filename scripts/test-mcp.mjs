@@ -336,6 +336,11 @@ const invalidAuthMode = await worker.fetch(new Request("https://example.test/mcp
   body: JSON.stringify({ jsonrpc: "2.0", id: 4, method: "tools/list" }),
 }), { NEW_RELIC_AUTH_MODE: "unknown" });
 assert.equal(invalidAuthMode.status, 503);
+const blankAuthMode = await worker.fetch(new Request("https://example.test/mcp", {
+  method: "POST", headers: { "content-type": "application/json" },
+  body: JSON.stringify({ jsonrpc: "2.0", id: 12, method: "tools/list" }),
+}), { NEW_RELIC_AUTH_MODE: "" });
+assert.equal(blankAuthMode.status, 503, "an explicitly blank auth mode must not silently fall back to Sites identity headers");
 const signedDeniedEnv = { ...signedProxyEnv, DB: new MemoryD1() };
 const noAuthUpstreamFetch = globalThis.fetch;
 let unauthenticatedUpstreamCalls = 0;
@@ -468,6 +473,8 @@ const pageResponse = await worker.fetch(new Request("https://example.test/"), {}
 assert.equal(pageResponse.status, 200);
 const page = await pageResponse.text();
 assert.match(page, /id="load-accounts"/);
+assert.match(page, /id="reconnect-link"/);
+assert.match(page, /New Relic接続情報を保存済み（有効性未確認）/);
 assert.match(page, /loadAccountsButton\.addEventListener/);
 assert.doesNotMatch(page, /await loadAccounts\(state\.selectedAccount\)/, "opening or refreshing status must not automatically fetch a billed account list");
 assert.match(page, /lang="ja"/);
@@ -483,6 +490,7 @@ class FakeElement {
   disabled = false;
   hidden = false;
   textContent = "";
+  href = "";
   addEventListener(type, callback) { this.listeners[type] = callback; }
   replaceChildren() { this.children = []; }
   append(child) { this.children.push(child); }
@@ -495,6 +503,7 @@ const fakeDocument = {
   createElement() { return new FakeElement(); },
 };
 const uiRequests = [];
+let rejectAccountList = false;
 const fakeFetch = async path => {
   uiRequests.push(path);
   if (path === "/api/status") return Response.json({
@@ -503,10 +512,13 @@ const fakeFetch = async path => {
     meteredReadsEnabled: true, tokenRefreshDue: false, requiresReauthentication: false,
     refreshError: null, providerReachable: null, statusSource: "local_metadata",
   });
-  if (path === "/api/accounts") return Response.json({
-    accounts: [{ id: "account-first", name: "First account" }, { id: "account-second", name: "Second account" }],
-    selectedAccount: { id: "account-second", name: "Second account" },
-  });
+  if (path === "/api/accounts") {
+    if (rejectAccountList) return Response.json({ error: "New Relic access requires reauthentication" }, { status: 401 });
+    return Response.json({
+      accounts: [{ id: "account-first", name: "First account" }, { id: "account-second", name: "Second account" }],
+      selectedAccount: { id: "account-second", name: "Second account" },
+    });
+  }
   throw new Error("Unexpected UI request " + path);
 };
 runInNewContext(page.match(/<script>([\s\S]*?)<\/script>/)[1], {
@@ -514,12 +526,19 @@ runInNewContext(page.match(/<script>([\s\S]*?)<\/script>/)[1], {
 });
 await new Promise(resolve => setTimeout(resolve, 0));
 assert.deepEqual(uiRequests, ["/api/status"], "status view must not auto-fetch accounts even after metered reads are enabled");
+assert.equal(uiElements.get("#reconnect-link").href, "/oauth/start?region=us");
+assert.match(uiElements.get("#connection-detail").textContent, /有効性・到達性は未確認/);
 await uiElements.get("#load-accounts").listeners.click();
 assert.deepEqual(uiRequests, ["/api/status", "/api/accounts"]);
 assert.equal(uiElements.get("#account").children[0].selected, false);
 assert.equal(uiElements.get("#account").children[1].selected, true,
   "the saved account remains selected even when it is not the first listed account");
 assert.equal(uiElements.get("#select-account").disabled, false);
+rejectAccountList = true;
+await uiElements.get("#load-accounts").listeners.click();
+assert.match(uiElements.get("#account-hint").textContent, /reauthentication/);
+assert.equal(uiElements.get("#reconnect-link").href, "/oauth/start?region=us",
+  "provider reauthentication errors must leave a reconnect action available without deleting local credentials");
 const statusWithoutIdentity = await worker.fetch(new Request("https://example.test/api/status"), {});
 assert.equal(statusWithoutIdentity.status, 200);
 assert.equal((await statusWithoutIdentity.json()).authenticated, false);

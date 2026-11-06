@@ -83,7 +83,7 @@ async function hash(value) {
 }
 
 export function authenticationMode(env = {}) {
-  const mode = env?.NEW_RELIC_AUTH_MODE || "sites";
+  const mode = env?.NEW_RELIC_AUTH_MODE === undefined ? "sites" : env.NEW_RELIC_AUTH_MODE;
   return mode === "sites" || mode === "signed_proxy" ? mode : "invalid";
 }
 

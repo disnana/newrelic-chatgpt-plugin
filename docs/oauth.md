@@ -24,6 +24,6 @@ https://docs.newrelic.com/docs/agentic-ai/mcp/overview/
 
 ## 副作用のない接続状態確認
 
-Workerの `/api/status` と `get_connection_status` は、保存済みD1メタデータだけを返し、New Relicへ接続せず、トークン更新もしません。`statusSource: local_metadata` と `tokenRefreshDue` は保存値の目安であり、トークンがNew Relic側で受理されるか・OAuth grantが有効かは証明しません。接続解除も行いません。
+Workerの `/api/status` と `get_connection_status` は、保存済みD1メタデータだけを返し、New Relicへ接続せず、トークン更新もしません。`statusSource: local_metadata` と `tokenRefreshDue` は保存値の目安であり、トークンがNew Relic側で受理されるか・OAuth grantが有効かは証明しません。UIでは保存済み情報を未検証と表示し、再接続リンクを常に提示します。再接続は接続情報を削除せず開始でき、成功時にだけ新しい資格情報へ置き換わります。接続解除も行いません。
 
 実際のrefresh失敗コードを取得するには、期限切れトークンでNew RelicへOAuth refresh requestを送る必要があり、refresh tokenがローテーションされる可能性があります。`get_connection_status` の旧到達性プローブも公式MCPを初期化し、設定次第で利用量を消費する可能性がありました。安全な診断と課金禁止の条件を守るため、この環境ではライブ状態確認やrefreshを再実行していません。過去に表示された非秘密の `refreshError.code` があれば、それだけで分類できます。トークン・認可URL・コールバックURLは共有しないでください。
