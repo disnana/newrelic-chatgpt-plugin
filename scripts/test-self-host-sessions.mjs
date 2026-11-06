@@ -86,6 +86,7 @@ const keys = await crypto.subtle.generateKey({
   name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: Uint8Array.of(1, 0, 1),
   hash: "SHA-256",
 }, false, ["sign", "verify"]);
+const pinnedWorkerKey = Buffer.from(await crypto.subtle.exportKey("spki", keys.publicKey)).toString("base64url");
 let backendCalls = 0;
 const gateway = createSelfHostGateway({
   externalOrigin: origin, issuer, audience, keyId: "synthetic-key", allowedSubjects: [subject],
@@ -173,6 +174,88 @@ assert.equal(completionFetchCalls[0].options.headers["x-csrf-token"], csrfToken)
 assert.equal(completionLocation, "/");
 assert.match(completionNodes.get("#status").textContent, /接続しました/);
 assert.equal(backendCalls, 3, "the genuine completion page reaches only the synthetic private backend after CSRF validation");
+
+// Connect the same browser-session adapter through the actual Worker so the
+// approval UI's browser sid and Worker CSRF session are proven end to end.
+const appSqlite = new DatabaseSync(":memory:");
+for (const migration of [
+  "0000_newrelic_mcp.sql", "0001_refresh_locks.sql", "0002_oauth_completion_fence.sql",
+  "0003_usage_consents.sql", "0004_operation_approval_store.sql", "0005_approval_retention_indexes.sql",
+]) appSqlite.exec(await readFile(new URL("../drizzle/" + migration, import.meta.url), "utf8"));
+const appDb = {
+  prepare(query) {
+    const statement = appSqlite.prepare(query);
+    let values = [];
+    return {
+      bind(...args) { values = args; return this; },
+      async run() { return { meta: { changes: Number(statement.run(...values).changes) } }; },
+      async first() { return statement.get(...values) || null; },
+      async all() { return { results: statement.all(...values) }; },
+    };
+  },
+  async batch(statements) {
+    appSqlite.exec("BEGIN IMMEDIATE");
+    try {
+      const results = [];
+      for (const statement of statements) results.push(await statement.run());
+      appSqlite.exec("COMMIT");
+      return results;
+    } catch (error) {
+      appSqlite.exec("ROLLBACK");
+      throw error;
+    }
+  },
+};
+const worker = (await import(new URL("../dist/server/index.js", import.meta.url).href + "?selfhost-session=" + Date.now())).default;
+const workerEnv = {
+  DB: appDb,
+  NEW_RELIC_AUTH_MODE: "signed_proxy",
+  NEW_RELIC_AUTH_JWT_PUBLIC_KEY: pinnedWorkerKey,
+  NEW_RELIC_AUTH_JWT_KID: "synthetic-key",
+  NEW_RELIC_AUTH_ISSUER: issuer,
+  NEW_RELIC_AUTH_AUDIENCE: audience,
+  NEW_RELIC_AUTH_ALLOWED_ORIGIN: origin,
+  NEW_RELIC_AUTH_ALLOWED_SUBJECTS: JSON.stringify([subject]),
+  NEW_RELIC_OPERATION_APPROVALS_ENABLED: "true",
+};
+let workerBackendCalls = 0;
+const approvalGateway = createSelfHostGateway({
+  externalOrigin: origin, issuer, audience, keyId: "synthetic-key", allowedSubjects: [subject],
+  signingKey: keys.privateKey,
+  authenticateBrowser: sessions.authenticateBrowser,
+  authenticateMcp: async () => null,
+  verifyBrowserCsrf: sessions.verifyBrowserCsrf,
+  backend: { async fetch(request) {
+    workerBackendCalls += 1;
+    assert.equal(request.headers.get("cookie"), null);
+    assert.equal(request.headers.get("x-csrf-token"), null);
+    if (new URL(request.url).pathname.endsWith("/session")) assert.equal(request.headers.get("x-approval-csrf"), null);
+    else assert.match(request.headers.get("x-approval-csrf"), /^[A-Za-z0-9_-]{43}$/);
+    return worker.fetch(request, workerEnv);
+  } },
+  // The Worker validates gateway JWT timestamps against the real wall clock.
+  // Keep this integration assertion inside that clock window; the synthetic
+  // D1 browser-session clock above remains independently controlled.
+  now: () => Date.now(),
+});
+const protectedHeaders = {
+  cookie, origin, "sec-fetch-site": "same-origin", "sec-fetch-mode": "cors", "sec-fetch-dest": "empty",
+  "x-csrf-token": csrfToken, "content-type": "application/json",
+};
+const approvalBootstrap = await approvalGateway.fetch(new Request(origin + "/api/operation-approvals/session", {
+  method: "POST", headers: protectedHeaders, body: "{}",
+}));
+assert.equal(approvalBootstrap.status, 200);
+assert.equal(approvalBootstrap.headers.get("set-cookie"), null, "gateway session cookies are not exposed to the Worker response path");
+const workerApprovalSession = await approvalBootstrap.json();
+assert.match(workerApprovalSession.csrfToken, /^[A-Za-z0-9_-]{43}$/);
+assert.equal(appSqlite.prepare("SELECT count(*) AS count FROM nr_approval_sessions").get().count, 1);
+const approvalList = await approvalGateway.fetch(new Request(origin + "/api/operation-approvals/list", {
+  method: "POST", headers: { ...protectedHeaders, "x-approval-csrf": workerApprovalSession.csrfToken }, body: "{}",
+}));
+assert.equal(approvalList.status, 200);
+assert.deepEqual((await approvalList.json()).items, []);
+assert.equal(workerBackendCalls, 2);
 
 const revoked = await sessions.revokeBrowserSession({ cookie });
 assert.equal(revoked.revoked, true);
