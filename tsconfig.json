@@ -16,6 +16,7 @@
     "worker/newrelic.js",
     "worker/mcp-policy.js",
     "worker/usage-consent.js",
+    "worker/operation-approval.js",
     "worker/nrql.js",
     "examples/self-host-gateway/gateway.mjs"
   ],

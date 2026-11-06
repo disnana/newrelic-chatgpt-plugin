@@ -113,9 +113,15 @@ async function forwardedToken(request) {
   assert.equal(claims.iss, issuer);
   assert.equal(claims.aud, audience);
   assert.equal(claims.sub, owner);
+  assert.equal(claims.channel, new URL(request.url).pathname === '/mcp' ? 'mcp' : 'browser');
   assert.equal(claims.iat, Math.floor(time / 1000));
   assert.equal(claims.exp - claims.iat, 60, 'assertion lifetime is 60 seconds');
   assert.match(claims.jti, /^[A-Za-z0-9_-]{20,32}$/);
+  if (new URL(request.url).pathname.startsWith('/api/operation-approvals/')) {
+    assert.equal(claims.sid, browserPrincipal.sessionId, 'approval assertion binds the stable browser session');
+  } else {
+    assert.equal(claims.sid, undefined, 'ordinary assertions do not carry a stable session binding');
+  }
   return token;
 }
 
@@ -266,6 +272,7 @@ assert.equal(calls.mcpAuth.length, 1);
 assert.equal(calls.browserAuth.length, 0);
 assert.equal(calls.backend.length, 1);
 await forwardedToken(calls.backend[0]);
+assert.equal(decode(calls.backend[0].headers.get('authorization').slice('Bearer '.length).split('.')[1]).channel, 'mcp');
 
 // Exercise the actual bundled Worker verifier behind the gateway. The ping tool
 // is local-only and does not access New Relic, D1, or an account.
@@ -318,6 +325,35 @@ backendResult = async (request) => {
   return Response.json({ ok: true });
 };
 assert.equal((await gateway.fetch(browserRequest('/'))).status, 200);
+
+// Approval-only routes require an authenticated stable browser session and
+// forward the worker's CSRF header, but never forward a browser cookie.
+resetState();
+browserPrincipal = {
+  subject: owner,
+  csrfContext: 'synthetic-session-context',
+  sessionId: 'stable-browser-session-identifier-0123456789',
+};
+backendResult = async (request) => {
+  assert.equal(request.headers.get('cookie'), null, 'browser cookies remain at the gateway');
+  assert.equal(request.headers.get('x-approval-csrf'), 'synthetic-approval-csrf');
+  await forwardedToken(request);
+  return Response.json({ ok: true });
+};
+const approvalSessionResponse = await gateway.fetch(browserRequest('/api/operation-approvals/session', {
+  method: 'POST',
+  headers: { cookie: 'auth-session=secret', 'x-approval-csrf': 'synthetic-approval-csrf', 'content-type': 'application/json' },
+  body: '{}',
+}));
+assert.equal(approvalSessionResponse.status, 200);
+assert.equal(calls.backend.length, 1);
+resetState();
+browserPrincipal = { subject: owner, csrfContext: 'synthetic-session-context' };
+const approvalWithoutStableSession = await gateway.fetch(browserRequest('/api/operation-approvals/session', {
+  method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+}));
+assert.equal(approvalWithoutStableSession.status, 401);
+assert.equal(calls.backend.length, 0, 'approval never falls back to subject or jti as a session binding');
 
 // Unsupported routes/methods, wrong hosts, and oversized bodies never reach the backend.
 for (const [request, expected] of [

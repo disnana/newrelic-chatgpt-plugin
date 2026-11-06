@@ -184,6 +184,9 @@ async function signedProxyPrincipal(request, env) {
   if (claims.iss !== issuer || !(claims.aud === audience || Array.isArray(claims.aud) && claims.aud.length <= 8 && claims.aud.includes(audience))
     || typeof subject !== "string" || !allowedSubjects.has(subject)) return null;
   if ([subject, claims.iss, issuer, audience].some(value => /[\u0000-\u001f\u007f]/.test(value))) return null;
+  if (claims.channel !== undefined && claims.channel !== "browser" && claims.channel !== "mcp") return null;
+  if (claims.sid !== undefined && (typeof claims.sid !== "string"
+    || claims.sid.length < 22 || claims.sid.length > 256 || !/^[A-Za-z0-9_-]+$/.test(claims.sid))) return null;
   const now = Math.floor(Date.now() / 1000);
   const { exp, iat, nbf } = claims;
   if (!Number.isSafeInteger(exp) || !Number.isSafeInteger(iat) || exp <= now - 30 || iat > now + 30
@@ -204,7 +207,7 @@ async function signedProxyPrincipal(request, env) {
     const verified = await crypto.subtle.verify({ name: "RSASSA-PKCS1-v1_5" }, key, signature, encoder.encode(parts[0] + "." + parts[1]));
     if (!verified) return null;
   } catch { return null; }
-  return { issuer, audience, subject };
+  return { issuer, audience, subject, channel: claims.channel || null, sessionId: claims.sid || null };
 }
 
 export async function siteUserId(request, env = {}) {
@@ -218,6 +221,17 @@ export async function siteUserId(request, env = {}) {
   const identity = request.headers.get("oai-authenticated-user-id");
   if (!identity || identity.length > 512) return null;
   return bytesToBase64Url(await hash(identity));
+}
+
+/** Stable, signed browser-session binding for D1-backed approval sessions. MCP assertions lack this context. */
+export async function approvalBrowserBinding(request, env = {}) {
+  if (authenticationMode(env) !== "signed_proxy") return null;
+  const principal = await signedProxyPrincipal(request, env);
+  if (!principal || principal.channel !== "browser" || !principal.sessionId) return null;
+  return bytesToBase64Url(await hash(
+    "signed_proxy_approval_session\0" + principal.issuer + "\0" + principal.audience + "\0"
+      + principal.subject + "\0" + principal.sessionId,
+  ));
 }
 
 async function encryptionKey(env) {
@@ -401,10 +415,11 @@ async function exchangeAuthorizationResponse({ state, code, error, redirectUri }
   const accessExpiresAt = tokenExpiry(token);
   const encryptedAccess = await encryptSecret(token.access_token, env);
   const encryptedRefresh = await encryptSecret(token.refresh_token, env);
+  const connectionGeneration = randomToken(24);
   const saved = await db.prepare(
-    "INSERT INTO nr_connections (user_id, encrypted_access_token, encrypted_refresh_token, access_expires_at, connected_at, region) SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM nr_oauth_states WHERE state_hash = ? AND user_id = ? AND consumed_at = ? AND expires_at >= ?) ON CONFLICT(user_id) DO UPDATE SET encrypted_access_token = excluded.encrypted_access_token, encrypted_refresh_token = excluded.encrypted_refresh_token, access_expires_at = excluded.access_expires_at, connected_at = excluded.connected_at, region = excluded.region",
+    "INSERT INTO nr_connections (user_id, encrypted_access_token, encrypted_refresh_token, access_expires_at, connected_at, region, connection_generation) SELECT ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM nr_oauth_states WHERE state_hash = ? AND user_id = ? AND consumed_at = ? AND expires_at >= ?) ON CONFLICT(user_id) DO UPDATE SET encrypted_access_token = excluded.encrypted_access_token, encrypted_refresh_token = excluded.encrypted_refresh_token, access_expires_at = excluded.access_expires_at, connected_at = excluded.connected_at, region = excluded.region, connection_generation = excluded.connection_generation",
   ).bind(consumed.user_id, encryptedAccess, encryptedRefresh, accessExpiresAt, now,
-    validRegion(consumed.region), stateHash, expectedUserId, claimedAt, Math.floor(now / 1000)).run();
+    validRegion(consumed.region), connectionGeneration, stateHash, expectedUserId, claimedAt, Math.floor(now / 1000)).run();
   if (Number(saved?.meta?.changes || 0) !== 1) {
     throw new NewRelicAuthError("接続解除または認証フローの変更を確認したため、新しい認証情報は保存しませんでした。接続をやり直してください。", "oauth_connection_cancelled");
   }
@@ -506,13 +521,31 @@ export async function getSelectedAccount(env, userId) {
   };
 }
 
+export async function getOperationApprovalContext(env, userId) {
+  if (!userId) return null;
+  const row = await database(env).prepare(
+    "SELECT c.region, c.connection_generation, p.account_id, p.selection_generation FROM nr_connections c INNER JOIN nr_preferences p ON p.user_id = c.user_id WHERE c.user_id = ?",
+  ).bind(userId).first();
+  if (!row || typeof row.account_id !== "string" || !row.account_id || row.account_id.length > 128
+    || !["us", "eu", "jp"].includes(row.region)
+    || typeof row.connection_generation !== "string" || !/^[A-Za-z0-9_-]{16,128}$/.test(row.connection_generation)
+    || typeof row.selection_generation !== "string" || !/^[A-Za-z0-9_-]{16,128}$/.test(row.selection_generation)) return null;
+  return {
+    accountId: row.account_id,
+    region: row.region,
+    connectionGeneration: row.connection_generation,
+    selectionGeneration: row.selection_generation,
+  };
+}
+
 export async function saveSelectedAccount(env, userId, account) {
   if (!userId) throw new Error("ChatGPTのSiteセッションを確認できません。");
   const accountId = String(account?.id ?? "");
   if (!accountId || accountId.length > 128) throw new Error("New RelicアカウントIDが不正です。");
+  const selectionGeneration = randomToken(24);
   await database(env).prepare(
-    "INSERT INTO nr_preferences (user_id, account_id, account_name, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET account_id = excluded.account_id, account_name = excluded.account_name, updated_at = excluded.updated_at",
-  ).bind(userId, accountId, String(account.name || "").slice(0, 512), Date.now()).run();
+    "INSERT INTO nr_preferences (user_id, account_id, account_name, updated_at, selection_generation) VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET account_name = excluded.account_name, updated_at = excluded.updated_at, selection_generation = CASE WHEN nr_preferences.account_id <> excluded.account_id THEN excluded.selection_generation ELSE nr_preferences.selection_generation END, account_id = excluded.account_id",
+  ).bind(userId, accountId, String(account.name || "").slice(0, 512), Date.now(), selectionGeneration).run();
 }
 
 export async function disconnectNewRelic(env, userId) {

@@ -16,5 +16,7 @@
 - Add live capability catalog and schema/metadata-pinned generic read adapter, with fail-closed policy and account gates
 - Keep write/destructive, unknown and unreviewed functionality disabled; Core/Advanced Compute reads require matching opt-ins and Preview adds another gate
 - Document 41 official reference tools, billing limits and Advent feature availability without claiming live parity
-- Preserve Scylla investigation workflows; retain Sites-only identity assumptions and document that general self-host authentication is not implemented
+- Preserve Scylla investigation workflows; keep Sites as default and document limits of operator-supplied self-host authentication
 - Add JavaScript checkJs type/null checking, full dependency audit and expanded mocked OAuth/MCP regression coverage
+- Add additive D1-backed approval session/proposal storage, browser CSRF/session binding, nonce single-use CAS, context generations and signed-proxy browser `sid` support; policy registry and dispatch remain disabled
+- Add synthetic SQLite-backed approval-state and gateway-session tests; no New Relic provider call is made

@@ -14,12 +14,13 @@ function wrapModule(name, source) {
   return `const __module_${name} = (() => {\nconst exports = Object.create(null);\n${body}\n${exports.map((key) => `exports[${JSON.stringify(key)}] = ${key};`).join("\n")}\nreturn exports;\n})();\n`;
 }
 
-const [entrySource, authSource, nrqlSource, policySource, usageConsentSource, page, oauthCompletePage] = await Promise.all([
+const [entrySource, authSource, nrqlSource, policySource, usageConsentSource, approvalSource, page, oauthCompletePage] = await Promise.all([
   read("worker/index.js"),
   read("worker/newrelic.js"),
   read("worker/nrql.js"),
   read("worker/mcp-policy.js"),
   read("worker/usage-consent.js"),
+  read("worker/operation-approval.js"),
   read("worker/page.html"),
   read("worker/oauth-complete.html"),
 ]);
@@ -36,7 +37,9 @@ let entry = entrySource
   .replace(/import\s*\{([\s\S]*?)\}\s*from\s*["']\.\/mcp-policy\.js["'];/g,
     "const {$1} = __module_policy;")
   .replace(/import\s*\{([\s\S]*?)\}\s*from\s*["']\.\/usage-consent\.js["'];/g,
-    "const {$1} = __module_usageConsent;");
+    "const {$1} = __module_usageConsent;")
+  .replace(/import\s*\{([\s\S]*?)\}\s*from\s*["']\.\/operation-approval\.js["'];/g,
+    "const {$1} = __module_operationApproval;");
 
 const auth = authSource.replace(/import\s*\{([\s\S]*?)\}\s*from\s*["']\.\/usage-consent\.js["'];/g,
   "const {$1} = __module_usageConsent;");
@@ -50,6 +53,7 @@ const bundle = [
   `const __module_page = Object.freeze({ default: ${JSON.stringify(page)} });`,
   `const __module_oauthCompletePage = Object.freeze({ default: ${JSON.stringify(oauthCompletePage)} });`,
   wrapModule("usageConsent", usageConsentSource),
+  wrapModule("operationApproval", approvalSource),
   wrapModule("nrql", nrqlSource),
   wrapModule("policy", policySource),
   wrapModule("newrelic", auth),

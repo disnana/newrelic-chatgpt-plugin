@@ -11,7 +11,7 @@ const worker = (await import(pathToFileURL(workerPath).href + "?test=" + Date.no
 const { normalizeNrql, buildComparisonNrql, validateLogFilter, validateLogWindow, filterMetricNames } =
   await import(pathToFileURL(resolve(root, "worker/nrql.js")).href + "?test=" + Date.now());
 const { schemaFingerprint } = await import(pathToFileURL(resolve(root, "worker/mcp-policy.js")).href + "?test=" + Date.now());
-const { beginNewRelicAuthorization, completePastedNewRelicAuthorization, disconnectNewRelic, decryptSecret, encryptSecret, siteUserId, getConnectionStatus, withNewRelicSession, findNewRelicTool } =
+const { beginNewRelicAuthorization, completePastedNewRelicAuthorization, disconnectNewRelic, decryptSecret, encryptSecret, siteUserId, approvalBrowserBinding, getConnectionStatus, withNewRelicSession, findNewRelicTool } =
   await import(pathToFileURL(resolve(root, "worker/newrelic.js")).href + "?test=" + Date.now());
 const { updateUsageConsents } = await import(pathToFileURL(resolve(root, "worker/usage-consent.js")).href + "?test=" + Date.now());
 
@@ -77,8 +77,12 @@ class MemoryD1 {
       return { meta: { changes: changed ? 1 : 0 } };
     }
     if (query.startsWith("INSERT INTO NR_PREFERENCES")) {
-      const [user_id, account_id, account_name, updated_at] = values;
-      this.preferences.set(user_id, { user_id, account_id, account_name, updated_at });
+      const [user_id, account_id, account_name, updated_at, selection_generation] = values;
+      const prior = this.preferences.get(user_id);
+      this.preferences.set(user_id, {
+        user_id, account_id, account_name, updated_at,
+        selection_generation: prior && prior.account_id === account_id ? prior.selection_generation : selection_generation,
+      });
       return { meta: { changes: 1 } };
     }
     if (query.startsWith("DELETE FROM NR_OAUTH_STATES WHERE USER_ID = ?")) {
@@ -133,12 +137,12 @@ class MemoryD1 {
       return { meta: { changes: 1 } };
     }
     if (query.startsWith("INSERT INTO NR_CONNECTIONS")) {
-      const [user_id, encrypted_access_token, encrypted_refresh_token, access_expires_at, connected_at, region, stateHash, expectedUserId, consumedAt, nowSeconds] = values;
+      const [user_id, encrypted_access_token, encrypted_refresh_token, access_expires_at, connected_at, region, connection_generation, stateHash, expectedUserId, consumedAt, nowSeconds] = values;
       if (query.includes("WHERE EXISTS (SELECT 1 FROM NR_OAUTH_STATES")) {
         const state = this.states.get(stateHash);
         if (state?.user_id !== expectedUserId || state.consumed_at !== consumedAt || state.expires_at < nowSeconds) return { meta: { changes: 0 } };
       }
-      this.connections.set(user_id, { user_id, encrypted_access_token, encrypted_refresh_token, access_expires_at, connected_at, region });
+      this.connections.set(user_id, { user_id, encrypted_access_token, encrypted_refresh_token, access_expires_at, connected_at, region, connection_generation });
       return { meta: { changes: 1 } };
     }
     throw new Error("Unexpected mock D1 run query: " + query);
@@ -271,6 +275,26 @@ const sameOwnerJwt = await makeGatewayJwt({ ...ownerClaims, iat: issuedAt + 1, e
 assert.equal(await siteUserId(new Request("https://example.test/", {
   headers: { authorization: "Bearer " + sameOwnerJwt },
 }), signedProxyEnv), ownerUserId, "principal storage identity is stable across short-lived assertions");
+const browserSessionId = "stable-browser-session-identifier-0123456789";
+const browserAssertion = await makeGatewayJwt({ ...ownerClaims, channel: "browser", sid: browserSessionId });
+const browserApprovalRequest = new Request("https://example.test/api/operation-approvals/session", {
+  method: "POST", headers: { authorization: "Bearer " + browserAssertion },
+});
+const approvalBinding = await approvalBrowserBinding(browserApprovalRequest, signedProxyEnv);
+assert.match(approvalBinding, /^[A-Za-z0-9_-]{43}$/);
+const renewedBrowserAssertion = await makeGatewayJwt({
+  ...ownerClaims, channel: "browser", sid: browserSessionId, iat: issuedAt + 1, exp: issuedAt + 301,
+});
+assert.equal(await approvalBrowserBinding(new Request("https://example.test/api/operation-approvals/session", {
+  headers: { authorization: "Bearer " + renewedBrowserAssertion },
+}), signedProxyEnv), approvalBinding, "renewed gateway assertions preserve the signed browser-session binding");
+assert.equal(await approvalBrowserBinding(new Request("https://example.test/api/operation-approvals/session", {
+  headers: { authorization: "Bearer " + ownerJwt },
+}), signedProxyEnv), null, "MCP/legacy assertions cannot bootstrap approval sessions");
+const otherBrowserAssertion = await makeGatewayJwt({ ...ownerClaims, channel: "browser", sid: "another-browser-session-id-0123456789" });
+assert.notEqual(await approvalBrowserBinding(new Request("https://example.test/api/operation-approvals/session", {
+  headers: { authorization: "Bearer " + otherBrowserAssertion },
+}), signedProxyEnv), approvalBinding, "different gateway browser sessions use different approval bindings");
 const memberJwt = await makeGatewayJwt({ ...ownerClaims, sub: "member-2" });
 const memberUserId = await siteUserId(new Request("https://example.test/", {
   headers: { authorization: "Bearer " + memberJwt },

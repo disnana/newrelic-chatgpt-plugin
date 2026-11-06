@@ -21,6 +21,11 @@ const ROUTES = new Map([
   ["/api/oauth/manual-complete", { methods: ["POST"], kind: "browser", csrf: true, maxBodyBytes: 8192 }],
   ["/api/select-account", { methods: ["POST"], kind: "browser", csrf: true, maxBodyBytes: 8192 }],
   ["/api/disconnect", { methods: ["POST"], kind: "browser", csrf: true, maxBodyBytes: 1024 }],
+  ["/api/operation-approvals/session", { methods: ["POST"], kind: "browser", csrf: true, sessionBinding: true, maxBodyBytes: 1024 }],
+  ["/api/operation-approvals/list", { methods: ["POST"], kind: "browser", csrf: true, sessionBinding: true, maxBodyBytes: 1024 }],
+  ["/api/operation-approvals/challenge", { methods: ["POST"], kind: "browser", csrf: true, sessionBinding: true, maxBodyBytes: 1024 }],
+  ["/api/operation-approvals/approve", { methods: ["POST"], kind: "browser", csrf: true, sessionBinding: true, maxBodyBytes: 2048 }],
+  ["/api/operation-approvals/cancel", { methods: ["POST"], kind: "browser", csrf: true, sessionBinding: true, maxBodyBytes: 1024 }],
   ["/mcp", { methods: ["POST"], kind: "mcp", csrf: false }],
 ]);
 
@@ -28,6 +33,7 @@ const FORWARDED_HEADERS = [
   "accept", "content-type", "origin", "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site",
   "mcp-protocol-version", "mcp-session-id", "last-event-id", "cache-control",
 ];
+const APPROVAL_FORWARDED_HEADERS = ["x-approval-csrf"];
 const RESPONSE_HEADERS = new Set([
   "allow", "content-type", "content-security-policy", "location", "mcp-session-id",
   "referrer-policy", "retry-after", "www-authenticate", "x-content-type-options",
@@ -38,7 +44,7 @@ function plain(value) {
     && [Object.prototype, null].includes(Object.getPrototypeOf(value));
 }
 
-/** @typedef {{subject: string, csrfContext?: unknown}} GatewayPrincipal */
+/** @typedef {{subject: string, csrfContext?: unknown, sessionId?: string}} GatewayPrincipal */
 /** @typedef {{url: string, method: string, cookie: string, origin: string|null, secFetchSite: string|null, secFetchMode: string|null, csrfToken: string|null}} BrowserAuthContext */
 /** @typedef {{url: string, method: string, authorization: string}} McpAuthContext */
 /** @typedef {{externalOrigin: string, issuer: string, audience: string, keyId: string, allowedSubjects: string[], signingKey: CryptoKey, authenticateBrowser: (context: BrowserAuthContext) => GatewayPrincipal|null|Promise<GatewayPrincipal|null>, authenticateMcp: (context: McpAuthContext) => GatewayPrincipal|null|Promise<GatewayPrincipal|null>, verifyBrowserCsrf: (context: {request: BrowserAuthContext, subject: string, context: unknown, path: string}) => boolean|Promise<boolean>, backend: {fetch: (request: Request) => Promise<Response>}, now?: () => number}} GatewayOptions */
@@ -46,8 +52,10 @@ function plain(value) {
 /** @param {unknown} value @returns {value is GatewayPrincipal} */
 function validPrincipal(value) {
   if (!plain(value)) return false;
-  const candidate = /** @type {{subject?: unknown}} */ (value);
-  return typeof candidate.subject === "string";
+  const candidate = /** @type {{subject?: unknown, sessionId?: unknown}} */ (value);
+  return typeof candidate.subject === "string"
+    && (candidate.sessionId === undefined || typeof candidate.sessionId === "string"
+      && /^[A-Za-z0-9_-]{22,256}$/.test(candidate.sessionId));
 }
 
 function exactHttpsOrigin(value) {
@@ -230,16 +238,19 @@ async function readBody(request, maxBytes) {
   return { tooLarge: false, body };
 }
 
-async function signedAssertion({ key, kid, issuer, audience, subject, nowSeconds }) {
+/** @param {{key: CryptoKey, kid: string, issuer: string|undefined, audience: string, subject: string, channel: string, sessionId?: string, nowSeconds: number}} options */
+async function signedAssertion({ key, kid, issuer, audience, subject, channel, sessionId, nowSeconds }) {
   const header = { alg: "RS256", typ: "JWT", kid };
   const claims = {
     iss: issuer,
     aud: audience,
     sub: subject,
+    channel,
     iat: nowSeconds,
     exp: nowSeconds + MAX_ASSERTION_TTL_SECONDS,
     jti: base64Url(crypto.getRandomValues(new Uint8Array(16))),
   };
+  if (sessionId !== undefined) claims.sid = sessionId;
   const signingInput = encodeJson(header) + "." + encodeJson(claims);
   const signature = await crypto.subtle.sign(
     { name: "RSASSA-PKCS1-v1_5" }, key, encoder.encode(signingInput),
@@ -362,6 +373,10 @@ export function createSelfHostGateway(options = {}) {
       if (!validPrincipal(principal) || !subjects.has(principal.subject)) {
         return route.kind === "mcp" ? jsonError(401, "authentication_required") : errorResponse(401, "Authentication required.");
       }
+      if (route.sessionBinding && (typeof principal.sessionId !== "string"
+        || !/^[A-Za-z0-9_-]{22,256}$/.test(principal.sessionId))) {
+        return errorResponse(401, "Browser session could not be verified.");
+      }
 
       if (route.csrf) {
         let csrfValid = false;
@@ -386,6 +401,8 @@ export function createSelfHostGateway(options = {}) {
           issuer,
           audience,
           subject: principal.subject,
+          channel: route.kind,
+          ...(route.sessionBinding ? { sessionId: principal.sessionId } : {}),
           nowSeconds: Math.floor(time / 1000),
         });
       } catch {
@@ -393,7 +410,7 @@ export function createSelfHostGateway(options = {}) {
       }
 
       const headers = new Headers();
-      for (const name of FORWARDED_HEADERS) {
+      for (const name of [...FORWARDED_HEADERS, ...(route.sessionBinding ? APPROVAL_FORWARDED_HEADERS : [])]) {
         const value = request.headers.get(name);
         if (value !== null) headers.set(name, value);
       }

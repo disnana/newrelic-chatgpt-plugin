@@ -15,7 +15,7 @@ Disnanaによる非公式のNew Relic連携です。各利用者が自分だけ�
 > 添付ZIPを展開し、既存SiteのIDを使わず新しい所有者限定のChatGPT Siteとして構築してください。Worker ESM、D1 binding DB、MCP capabilityを使用し、drizzleのmigrationを順に適用してください。NEW_RELIC_TOKEN_ENCRYPTION_KEYにはSiteごとに暗号学的に安全な32バイトのbase64url鍵を生成し、値を会話・ログ・ソースへ出さずSiteのSecretに設定してください。ビルドとテスト後、所有者限定で公開し、このSiteに紐づくプラグインを接続してください。一般公開しないでください。
 
 2. Sites側の環境が鍵の安全な生成・設定を扱えない場合は、その処理を止めてください。鍵をチャットに貼らず、利用できる安全なSecret設定方法を確認してください。
-3. SiteのD1にmigration `0000_newrelic_mcp.sql`、`0001_refresh_locks.sql`、`0002_oauth_completion_fence.sql`、`0003_usage_consents.sql` を順に適用する。0003はユーザーごとのCore・Advanced・Preview利用許可を30日間保存する追加テーブルです。既存の接続・設定データは変更しません。
+3. SiteのD1にmigration `0000_newrelic_mcp.sql`、`0001_refresh_locks.sql`、`0002_oauth_completion_fence.sql`、`0003_usage_consents.sql`、`0004_operation_approval_store.sql` を順に適用する。0003はユーザーごとのCore・Advanced・Preview利用許可を30日間保存します。0004は接続・アカウント行を維持しながら generation 列を追加して、空の承認セッション／提案テーブルを作ります。0004はWrite/Destructiveを有効化しません。どちらも追加のみのmigrationです。
 4. 所有者限定で公開したSiteを開き、New Relicのリージョンを選んで接続する。認証後のlocalhost画面ではアドレス欄のURL全体をSite内の認証完了ページに貼る。認可コードを含むURLをチャットや他人に送らない。
 5. Siteの「利用カテゴリごとの許可」でCore Compute読み取りを明示的に選択してから、アカウント一覧や通常のNRQL・メトリクス・ログ・アラートを使う。New Relicの契約・料金モデルはこの連携から確認できません。CCU計測だけで追加料金を意味するわけではなく、利用が契約内か別料金かは契約条件によります。Advanced Compute (aCCU) AI分析は別の許可と対応する契約または試用枠が必要です。許可は30日で期限切れになり、同じ画面で解除できます。新規環境・iPhoneでの全手順は未検証。
 

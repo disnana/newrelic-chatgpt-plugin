@@ -14,13 +14,17 @@ import {
   disconnectNewRelic,
   findNewRelicTool,
   getConnectionStatus,
+  getOperationApprovalContext,
   getSelectedAccount,
   saveSelectedAccount,
   authenticationMode,
+  approvalBrowserBinding,
   isRequestOriginAllowed,
   publicAppOrigin,
   siteUserId,
   withNewRelicSession,
+  encryptSecret,
+  decryptSecret,
 } from "./newrelic.js";
 import {
   NrqlValidationError,
@@ -33,6 +37,7 @@ import {
 
 import { capabilityCatalog, reviewReadTool, authorizeReadTool, validateToolResult, validateSchema, McpPolicyError } from "./mcp-policy.js";
 import { getUsageConsents, isValidUsageConsentChoices, updateUsageConsents } from "./usage-consent.js";
+import { approvalCookieHeader, createOperationApprovalService, OperationApprovalError } from "./operation-approval.js";
 
 const MCP_VERSION = "2026-07-28";
 const MAX_REQUEST_BYTES = 16 * 1024;
@@ -754,6 +759,14 @@ async function handleApi(request, env, pathname) {
   if (authMode === "signed_proxy" && !isRequestOriginAllowed(request, env)) {
     return jsonResponse({ error: "Origin is not allowed." }, 403);
   }
+  const approvalPaths = new Set([
+    "/api/operation-approvals/session", "/api/operation-approvals/list",
+    "/api/operation-approvals/challenge", "/api/operation-approvals/approve",
+    "/api/operation-approvals/cancel",
+  ]);
+  if (approvalPaths.has(pathname) && !isRequestOriginAllowed(request, env, true)) {
+    return jsonResponse({ error: "Approval requests require the authenticated first-party origin." }, 403);
+  }
   if (pathname === "/api/status" && request.method === "GET") {
     if (userId) await consumeRateLimit(env, userId, 20);
     const status = await getConnectionStatus(env, userId);
@@ -781,6 +794,67 @@ async function handleApi(request, env, pathname) {
     if (!isValidUsageConsentChoices(choices)) return jsonResponse({ error: "利用量の許可設定が不正です。" }, 400);
     await consumeRateLimit(env, userId, 20);
     return jsonResponse({ usageConsents: await updateUsageConsents(env, userId, choices) });
+  }
+  if (approvalPaths.has(pathname)) {
+    if (env.NEW_RELIC_OPERATION_APPROVALS_ENABLED !== "true") {
+      return jsonResponse({ error: "Operation approvals are unavailable." }, 404);
+    }
+    if (request.method !== "POST") return jsonResponse({ error: "Method not allowed." }, 405, { allow: "POST" });
+    requireUser(userId);
+    if (!(request.headers.get("content-type") || "").toLowerCase().startsWith("application/json")) {
+      return jsonResponse({ error: "JSON is required." }, 415);
+    }
+    const args = await parseSmallJson(request);
+    if (!args || Array.isArray(args) || typeof args !== "object") return jsonResponse({ error: "Invalid request." }, 400);
+    const expectedKeys = {
+      "/api/operation-approvals/session": [],
+      "/api/operation-approvals/list": [],
+      "/api/operation-approvals/challenge": ["proposalId"],
+      "/api/operation-approvals/approve": ["approvalNonce", "proposalId"],
+      "/api/operation-approvals/cancel": ["proposalId"],
+    }[pathname];
+    if (!expectedKeys || Object.keys(args).sort().join(",") !== expectedKeys.slice().sort().join(",")) {
+      return jsonResponse({ error: "Invalid request." }, 400);
+    }
+    await consumeRateLimit(env, userId, 20, "approval");
+    const browserBinding = authMode === "signed_proxy" ? await approvalBrowserBinding(request, env) : null;
+    const service = createOperationApprovalService({
+      db: env.DB,
+      encryptArguments: (value) => encryptSecret(value, env),
+      decryptArguments: (value) => decryptSecret(value, env),
+      enabled: true,
+    });
+    if (pathname === "/api/operation-approvals/session") {
+      const session = await service.ensureSession({ request, userId, authMode, browserBinding });
+      const headers = {};
+      if (authMode === "sites" && session.created) {
+        const maxAge = Math.max(1, Math.min(900, Math.floor((session.expiresAt - Date.now()) / 1000)));
+        headers["set-cookie"] = approvalCookieHeader(session.cookieToken, maxAge);
+      }
+      return jsonResponse({ sessionExpiresAt: session.expiresAt, csrfToken: session.csrfToken }, 200, headers);
+    }
+    const csrfToken = request.headers.get("x-approval-csrf");
+    const session = await service.requireSession({ request, userId, authMode, browserBinding, csrfToken });
+    if (pathname === "/api/operation-approvals/list") {
+      const context = await getOperationApprovalContext(env, userId);
+      return jsonResponse(context
+        ? await service.listPending({ userId, context })
+        : { enabled: true, items: [] });
+    }
+    const proposalId = typeof args.proposalId === "string" ? args.proposalId : "";
+    const context = await getOperationApprovalContext(env, userId);
+    if (!context) return jsonResponse({ error: "No current connection and account context is available." }, 409);
+    if (pathname === "/api/operation-approvals/challenge") {
+      return jsonResponse(await service.issueChallenge({ userId, sessionKeyHash: session.sessionKeyHash, proposalId, context }));
+    }
+    if (pathname === "/api/operation-approvals/approve") {
+      const approvalNonce = typeof args.approvalNonce === "string" ? args.approvalNonce : "";
+      const result = await service.approve({ userId, sessionKeyHash: session.sessionKeyHash, proposalId, approvalNonce, context });
+      return jsonResponse({ ...result, dispatchAvailable: false, message: "Approval recorded. No New Relic mutation was sent." });
+    }
+    if (pathname === "/api/operation-approvals/cancel") {
+      return jsonResponse(await service.cancel({ userId, sessionKeyHash: session.sessionKeyHash, proposalId, context }));
+    }
   }
   if (pathname === "/api/capabilities" && request.method === "GET") {
     requireUser(userId);
@@ -914,10 +988,13 @@ export default {
       try {
         return await handleApi(request, env, pathname);
       } catch (error) {
-        const status = error instanceof NewRelicAuthError ? 401 : 502;
-        const message = error instanceof Error ? error.message : "リクエストに失敗しました。";
+        const status = error instanceof OperationApprovalError ? error.status : error instanceof NewRelicAuthError ? 401 : 502;
+        const message = error instanceof OperationApprovalError
+          ? "Operation approval request could not be completed."
+          : error instanceof Error ? error.message : "リクエストに失敗しました。";
         const errorCode = safeDiagnosticCode(error);
-        return jsonResponse({ error: redactSensitive(message), ...(errorCode ? { errorCode } : {}) }, status);
+        const approvalCode = error instanceof OperationApprovalError ? error.code : null;
+        return jsonResponse({ error: redactSensitive(message), ...(approvalCode ? { errorCode: approvalCode } : errorCode ? { errorCode } : {}) }, status);
       }
     }
     if (pathname !== "/") return new Response("Not found", { status: 404, headers: { "cache-control": "no-store" } });

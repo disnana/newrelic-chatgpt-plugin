@@ -305,7 +305,10 @@ try {
   const pageSource = await readFile(new URL("../worker/page.html", import.meta.url), "utf8");
   const demoSource = await readFile(new URL("../examples/operation-approval/demo.mjs", import.meta.url), "utf8");
   const rehearsalSource = await readFile(new URL("../examples/operation-approval/rehearsal.mjs", import.meta.url), "utf8");
-  assert.doesNotMatch(workerSource, /\/api\/operation-approval|write_official_mcp|execute_write_operation/);
+  assert.match(workerSource, /\/api\/operation-approvals\/session/,
+    "the Worker contains the owner/session-bound D1 approval foundation");
+  assert.doesNotMatch(workerSource, /\/api\/operation-approvals\/propose|write_official_mcp|execute_write_operation/,
+    "no public proposal-creation or provider-dispatch route exists");
   assert.doesNotMatch(workerBundle, /demo_set_alert_threshold|MockApprovalStore|operation-approval\/demo/,
     "the synthetic rehearsal must not be included in the production Worker bundle");
   assert.match(workerSource, /"operation_approval_not_implemented"/);
