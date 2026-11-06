@@ -11,17 +11,39 @@ const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
 export class NewRelicAuthError extends Error {
-  constructor(message = "New Relicへの再認証が必要です。接続ページから再接続してください。") {
+  constructor(message = "New Relicへの再認証が必要です。接続ページから再接続してください。", code = "reauthentication_required", refreshable = false) {
     super(message);
     this.name = "NewRelicAuthError";
+    this.code = code;
+    this.requiresReauthentication = !refreshable;
+    this.refreshable = refreshable;
   }
 }
 
 export class NewRelicRemoteError extends Error {
-  constructor(message = "New Relic公式MCPから正常な応答を取得できませんでした。") {
+  constructor(message = "New Relic公式MCPから正常な応答を取得できませんでした。", code = "provider_error", retryable = false) {
     super(message);
     this.name = "NewRelicRemoteError";
+    this.code = code;
+    this.retryable = retryable;
+    this.requiresReauthentication = false;
   }
+}
+
+function credentialError() {
+  return new NewRelicRemoteError("保存済み認証情報を復号できません。暗号鍵と保存設定を確認してください。認証情報は保持されています。", "credential_storage_error");
+}
+
+function tokenExpiry(payload) {
+  const seconds = payload.expires_in === undefined ? 300 : Number(payload.expires_in);
+  if (!Number.isFinite(seconds) || seconds <= 0 || seconds > 86400) {
+    throw new NewRelicRemoteError("OAuth応答の有効期限が不正です。", "invalid_token_response");
+  }
+  return Date.now() + seconds * 1000;
+}
+
+function validToken(value) {
+  return typeof value === "string" && value.length > 0 && value.length <= 16384 && !/[\r\n\u0000]/.test(value);
 }
 
 function database(env) {
@@ -134,36 +156,53 @@ export async function beginNewRelicAuthorization(request, env, userId, requested
 }
 
 async function tokenRequest(form) {
-  let response;
-  try {
-    response = await fetch(TOKEN_ENDPOINT, {
-      method: "POST",
-      headers: {
-        "content-type": "application/x-www-form-urlencoded",
-        accept: "application/json",
-        "cache-control": "no-store",
-      },
-      body: new URLSearchParams(form),
-      signal: AbortSignal.timeout(12000),
-    });
-  } catch {
-    throw new NewRelicRemoteError("New Relic OAuthトークンエンドポイントへ接続できませんでした。");
-  }
-
-  let payload;
-  try {
-    payload = await response.json();
-  } catch {
-    throw new NewRelicRemoteError("New Relic OAuthからJSON以外の応答が返りました。");
-  }
-  if (!response.ok || payload?.error) {
-    const error = String(payload?.error || "");
-    if (["invalid_grant", "access_denied", "invalid_client"].includes(error)) {
-      throw new NewRelicAuthError("New Relicの認証が期限切れか、このOAuthクライアントで認証できません。接続をやり直してください。");
+  // Refresh rotation can commit upstream before a timeout/5xx reaches us. Never
+  // blindly replay those ambiguous exchanges. A rejected 429 is retried once.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let response;
+    try {
+      response = await fetch(TOKEN_ENDPOINT, {
+        method: "POST", redirect: "error",
+        headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json", "cache-control": "no-store" },
+        body: new URLSearchParams(form), signal: AbortSignal.timeout(12000),
+      });
+    } catch {
+      throw new NewRelicRemoteError("New Relic OAuthへの接続が一時的に失敗しました。認証情報は保持されています。", "oauth_network_error", true);
     }
-    throw new NewRelicRemoteError("New Relic OAuthのトークン交換に失敗しました。");
+    if (response.status === 429) {
+      const retryAfter = Number(response.headers.get("retry-after") || 0);
+      await response.body?.cancel();
+      if (attempt === 0 && retryAfter >= 0 && retryAfter <= 1) {
+        await new Promise((resolve) => setTimeout(resolve, Math.max(100, retryAfter * 1000)));
+        continue;
+      }
+      throw new NewRelicRemoteError("New Relic OAuthの呼び出し上限です。時間を置いて再試行してください。", "oauth_rate_limited", true);
+    }
+    if (response.status >= 500) {
+      await response.body?.cancel();
+      throw new NewRelicRemoteError("New Relic OAuthで一時的な障害が発生しています。認証情報は保持されています。", "oauth_unavailable", true);
+    }
+    let payload;
+    try { payload = JSON.parse(await readBoundedBody(response, 64 * 1024)); }
+    catch { throw new NewRelicRemoteError("New Relic OAuthの応答形式が不正です。", "invalid_token_response"); }
+    if (!response.ok || payload?.error) {
+      const error = payload?.error;
+      if (error === "invalid_grant" || error === "access_denied") {
+        throw new NewRelicAuthError("New Relicの認可が失効または拒否されました。再接続してください。", "oauth_" + error);
+      }
+      if (error === "invalid_client" || error === "unauthorized_client" || error === "invalid_scope") {
+        throw new NewRelicRemoteError("New Relic OAuthクライアント設定を確認してください。再ログインだけでは解決しない可能性があります。", "oauth_configuration_error");
+      }
+      throw new NewRelicRemoteError("New Relic OAuthのトークン交換が拒否されました。", "oauth_rejected");
+    }
+    if (!payload || Array.isArray(payload) || !validToken(payload.access_token)
+      || (payload.refresh_token !== undefined && !validToken(payload.refresh_token))
+      || (payload.token_type !== undefined && String(payload.token_type).toLowerCase() !== "bearer")) {
+      throw new NewRelicRemoteError("New Relic OAuthから有効なトークン応答を取得できませんでした。", "invalid_token_response");
+    }
+    tokenExpiry(payload);
+    return payload;
   }
-  return payload;
 }
 
 async function exchangeAuthorizationResponse({ state, code, error, redirectUri }, env, expectedUserId) {
@@ -209,7 +248,7 @@ async function exchangeAuthorizationResponse({ state, code, error, redirectUri }
   }
 
   const now = Date.now();
-  const accessExpiresAt = now + Math.max(30, Number(token.expires_in) || 300) * 1000;
+  const accessExpiresAt = tokenExpiry(token);
   const encryptedAccess = await encryptSecret(token.access_token, env);
   const encryptedRefresh = await encryptSecret(token.refresh_token, env);
   await db.prepare(
@@ -266,6 +305,7 @@ export async function getConnectionStatus(env, userId) {
   if (!connection) return { authenticated: true, connected: false, selectedAccount: null };
 
   let requiresReauthentication = false;
+  let refreshError = null;
   let currentConnection = connection;
   if (Number(connection.access_expires_at) <= Date.now() + 30000) {
     try {
@@ -274,8 +314,8 @@ export async function getConnectionStatus(env, userId) {
         "SELECT connected_at, access_expires_at, region FROM nr_connections WHERE user_id = ?",
       ).bind(userId).first() || connection;
     } catch (error) {
-      if (error instanceof NewRelicAuthError) requiresReauthentication = true;
-      else throw error;
+      requiresReauthentication = error instanceof NewRelicAuthError && error.requiresReauthentication;
+      refreshError = { code: error.code || "storage_error", retryable: Boolean(error.retryable), message: error instanceof NewRelicAuthError || error instanceof NewRelicRemoteError ? error.message : "認証情報の保存処理を確認してください。" };
     }
   }
   return {
@@ -286,6 +326,8 @@ export async function getConnectionStatus(env, userId) {
     region: validRegion(currentConnection.region),
     selectedAccount: await getSelectedAccount(env, userId),
     requiresReauthentication,
+    refreshError,
+    refreshPolicy: { proactiveWindowSeconds: 30, providerReauthenticationHours: 24 },
   };
 }
 
@@ -346,22 +388,22 @@ async function refreshAccessToken(env, userId, connection, lockOwner) {
   try {
     refreshToken = await decryptSecret(connection.encrypted_refresh_token, env);
   } catch {
-    throw new NewRelicAuthError();
+    throw credentialError();
   }
   const payload = await tokenRequest({
     grant_type: "refresh_token",
     client_id: CLIENT_ID,
     refresh_token: refreshToken,
   });
-  if (typeof payload.access_token !== "string") throw new NewRelicAuthError();
+  if (!validToken(payload.access_token)) throw new NewRelicRemoteError("OAuth応答が不正です。", "invalid_token_response");
   const nextRefresh = typeof payload.refresh_token === "string" ? payload.refresh_token : refreshToken;
   const encryptedAccess = await encryptSecret(payload.access_token, env);
   const encryptedRefresh = await encryptSecret(nextRefresh, env);
-  const accessExpiresAt = Date.now() + Math.max(30, Number(payload.expires_in) || 300) * 1000;
+  const accessExpiresAt = tokenExpiry(payload);
   const saved = await database(env).prepare(
     "UPDATE nr_connections SET encrypted_access_token = ?, encrypted_refresh_token = ?, access_expires_at = ? WHERE user_id = ? AND encrypted_refresh_token = ? AND EXISTS (SELECT 1 FROM nr_refresh_locks WHERE user_id = ? AND owner = ? AND expires_at > ?)",
   ).bind(encryptedAccess, encryptedRefresh, accessExpiresAt, userId, connection.encrypted_refresh_token, userId, lockOwner, Date.now()).run();
-  if (Number(saved?.meta?.changes || 0) !== 1) throw new NewRelicAuthError("接続状態が更新されました。もう一度お試しください。");
+  if (Number(saved?.meta?.changes || 0) !== 1) throw new NewRelicRemoteError("接続状態が変更されたため更新結果を保存しませんでした。再試行してください。", "connection_changed", true);
   return payload.access_token;
 }
 
@@ -377,7 +419,7 @@ async function accessToken(env, userId, forceRefresh = false, failedToken = null
         region: validRegion(connection.region),
       };
     } catch {
-      throw new NewRelicAuthError();
+      throw credentialError();
     }
   }
   const db = database(env);
@@ -392,7 +434,8 @@ async function accessToken(env, userId, forceRefresh = false, failedToken = null
       try {
         connection = await fetchConnection(env, userId);
         if (!connection) throw new NewRelicAuthError();
-        const current = await decryptSecret(connection.encrypted_access_token, env);
+        let current;
+        try { current = await decryptSecret(connection.encrypted_access_token, env); } catch { throw credentialError(); }
         if ((!forceRefresh && Number(connection.access_expires_at) > Date.now() + 30000)
           || (forceRefresh && failedToken && current !== failedToken)) {
           return { token: current, region: validRegion(connection.region) };
@@ -404,14 +447,10 @@ async function accessToken(env, userId, forceRefresh = false, failedToken = null
     }
     await new Promise((resolve) => setTimeout(resolve, 150));
   }
-  throw new NewRelicRemoteError("認証情報を更新中です。少し待ってから再試行してください。");
+  throw new NewRelicRemoteError("認証情報を更新中です。少し待ってから再試行してください。", "refresh_busy", true);
 }
 
-async function readMcpResponse(response, maxBytes) {
-  if (response.status === 401 || response.status === 403) throw new NewRelicAuthError();
-  if (response.status === 429) {
-    throw new NewRelicRemoteError("New Relic公式MCPの呼び出し上限に達しました。少し待ってから再試行してください。");
-  }
+async function readBoundedBody(response, maxBytes) {
   const reader = response.body?.getReader();
   const chunks = [];
   let size = 0;
@@ -431,6 +470,14 @@ async function readMcpResponse(response, maxBytes) {
   let offset = 0;
   for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
   const body = decoder.decode(bytes);
+  return body;
+}
+
+async function readMcpResponse(response, maxBytes) {
+  if (response.status === 401) throw new NewRelicAuthError("New Relicのアクセストークンが拒否されました。", "access_token_rejected", true);
+  if (response.status === 403) throw new NewRelicRemoteError("New Relicの権限または組織のMCP設定によって拒否されました。", "permission_denied");
+  if (response.status === 429) throw new NewRelicRemoteError("New Relic公式MCPの呼び出し上限です。時間を置いて再試行してください。", "provider_rate_limited", true);
+  const body = await readBoundedBody(response, maxBytes);
   if (!response.ok) {
     throw new NewRelicRemoteError("New Relic公式MCPへのリクエストに失敗しました。HTTP " + response.status + "。");
   }
@@ -459,7 +506,6 @@ async function postMcp(endpoint, token, sessionId, payload) {
     "content-type": "application/json",
     accept: "application/json, text/event-stream",
     "mcp-protocol-version": MCP_PROTOCOL_VERSION,
-    "include-tags": "discovery,data-access,alerting",
     "cache-control": "no-store",
   });
   if (sessionId) headers.set("mcp-session-id", sessionId);
@@ -467,6 +513,7 @@ async function postMcp(endpoint, token, sessionId, payload) {
   try {
     response = await fetch(endpoint, {
       method: "POST",
+      redirect: "error",
       headers,
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(12000),
@@ -477,10 +524,10 @@ async function postMcp(endpoint, token, sessionId, payload) {
   const nextSessionId = response.headers.get("mcp-session-id") || sessionId || null;
   const parsed = await readMcpResponse(response, payload.method === "tools/list" ? 2 * 1024 * 1024 : 256 * 1024);
   if (parsed?.error) {
-    if (parsed.error.code === -32001 || /auth|token|unauthorized/i.test(String(parsed.error.message || ""))) {
-      throw new NewRelicAuthError();
-    }
     throw new NewRelicRemoteError("New Relic公式MCPがリクエストを拒否しました。");
+  }
+  if (payload.id !== undefined && (!parsed || parsed.jsonrpc !== "2.0" || parsed.id !== payload.id || typeof parsed.result !== "object" || parsed.result === null)) {
+    throw new NewRelicRemoteError("New Relic公式MCPの応答IDまたは形式が一致しません。", "invalid_mcp_response");
   }
   return { payload: parsed, sessionId: nextSessionId };
 }
@@ -493,7 +540,7 @@ async function startRemoteSession(endpoint, token) {
     params: {
       protocolVersion: MCP_PROTOCOL_VERSION,
       capabilities: {},
-      clientInfo: { name: "newrelic-chatgpt-sites", version: "0.2.0" },
+      clientInfo: { name: "newrelic-chatgpt-sites", version: "0.4.0" },
     },
   });
   if (!initialized.payload?.result) {
@@ -576,7 +623,7 @@ function buildUpstreamArguments(tool, values) {
   return args;
 }
 
-async function callRemoteTool(session, toolName, values = {}) {
+async function callRemoteTool(session, toolName, values = {}, raw = false) {
   session.callCount += 1;
   if (session.callCount > 8) {
     throw new NewRelicRemoteError("1回の調査で実行できるNew Relic呼び出し数の上限に達しました。");
@@ -591,23 +638,19 @@ async function callRemoteTool(session, toolName, values = {}) {
     method: "tools/call",
     params: {
       name: toolName,
-      arguments: buildUpstreamArguments(definition, values),
+      arguments: raw ? values : buildUpstreamArguments(definition, values),
     },
   });
   session.sessionId = response.sessionId || session.sessionId;
   const result = response.payload?.result;
-  if (!result) throw new NewRelicRemoteError("New Relic公式MCPからツール結果が返りませんでした。");
+  if (!result || !Array.isArray(result.content) || result.content.some((item) => !item || typeof item.type !== "string") || (result.isError !== undefined && typeof result.isError !== "boolean")) throw new NewRelicRemoteError("New Relic公式MCPからツール結果が返りませんでした。");
   if (result.isError) {
-    const message = Array.isArray(result.content)
-      ? result.content.filter((item) => item.type === "text").map((item) => item.text).join("\n")
-      : "";
-    if (/auth|token|unauthorized/i.test(message)) throw new NewRelicAuthError();
     throw new NewRelicRemoteError("New Relic公式MCPのツール呼び出しが失敗しました。権限と入力を確認してください。");
   }
   return result;
 }
 
-export async function withNewRelicSession(env, userId, callback) {
+export async function withNewRelicSession(env, userId, callback, options = {}) {
   let lastError;
   let failedToken = null;
   for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -618,7 +661,7 @@ export async function withNewRelicSession(env, userId, callback) {
       return await callback(session);
     } catch (error) {
       lastError = error;
-      if (!(error instanceof NewRelicAuthError) || attempt === 1) throw error;
+      if (!(error instanceof NewRelicAuthError) || !error.refreshable || attempt === 1 || options.readOnly === false) throw error;
       failedToken = auth.token;
     }
   }
@@ -627,6 +670,12 @@ export async function withNewRelicSession(env, userId, callback) {
 
 export async function callNewRelicTool(session, toolName, values = {}) {
   return callRemoteTool(session, toolName, values);
+}
+
+// Only callers that have performed schema, policy, account and approval checks
+// may use this exact-argument transport. It is not exposed as an MCP tool.
+export async function callNewRelicRawTool(session, toolName, validatedArgs = {}) {
+  return callRemoteTool(session, toolName, validatedArgs, true);
 }
 
 export function findNewRelicTool(session, candidates) {
