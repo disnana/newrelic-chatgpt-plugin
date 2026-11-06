@@ -250,12 +250,27 @@ assert.equal(approvalBootstrap.headers.get("set-cookie"), null, "gateway session
 const workerApprovalSession = await approvalBootstrap.json();
 assert.match(workerApprovalSession.csrfToken, /^[A-Za-z0-9_-]{43}$/);
 assert.equal(appSqlite.prepare("SELECT count(*) AS count FROM nr_approval_sessions").get().count, 1);
+const invalidApprovalCsrf = await approvalGateway.fetch(new Request(origin + "/api/operation-approvals/list", {
+  method: "POST", headers: { ...protectedHeaders, "x-approval-csrf": "A".repeat(43) }, body: "{}",
+}));
+assert.equal(invalidApprovalCsrf.status, 403, "the Worker rejects a forged approval CSRF token through the real gateway");
+const swappedBrowserSession = await approvalGateway.fetch(new Request(origin + "/api/operation-approvals/list", {
+  method: "POST",
+  headers: {
+    ...protectedHeaders,
+    cookie: secondBrowserCookie,
+    "x-csrf-token": secondBrowser.setCookieHeaders[1].match(/=([^;]+)/)[1],
+    "x-approval-csrf": workerApprovalSession.csrfToken,
+  },
+  body: "{}",
+}));
+assert.equal(swappedBrowserSession.status, 401, "a different authenticated browser sid cannot reuse the first approval session");
 const approvalList = await approvalGateway.fetch(new Request(origin + "/api/operation-approvals/list", {
   method: "POST", headers: { ...protectedHeaders, "x-approval-csrf": workerApprovalSession.csrfToken }, body: "{}",
 }));
 assert.equal(approvalList.status, 200);
 assert.deepEqual((await approvalList.json()).items, []);
-assert.equal(workerBackendCalls, 2);
+assert.equal(workerBackendCalls, 4);
 
 const revoked = await sessions.revokeBrowserSession({ cookie });
 assert.equal(revoked.revoked, true);
