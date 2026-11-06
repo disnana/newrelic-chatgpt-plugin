@@ -12,7 +12,8 @@ The v0.4.0 hardening worktree was validated locally with Node.js 24.22.1 and Pyt
 - Distribution and secret-pattern checks: passed; the checker explicitly notes it is not a complete secret detector.
 - Local v0.4.0 source ZIP generation and checksum: passed.
 - `npm audit --audit-level=high`: passed on 2026-11-06; npm reported `found 0 vulnerabilities` (exit 0). The audit used the committed package manifest and lockfile.
-- Draft PR #3's previously published source commit passed GitHub Actions CI #73, but these additional local consent/gateway changes have not yet been published or tested by CI.
+- Draft PR #3's latest published source snapshot, including the audit correction, passed GitHub Actions CI #75. The separate synthetic operation-approval rehearsal commit on this local branch has not yet been published or tested by CI.
+- Synthetic operation-approval state-machine and DOM-stub UI tests: passed. They use hard-coded fake targets and an in-memory mock; no real approval endpoint, persistence, dispatch, or provider call exists.
 
 ## Live-provider boundary
 
@@ -24,8 +25,8 @@ The documentation inventory contains 41 tool names, but the authenticated accoun
 
 - A fresh ChatGPT Site installation, real OAuth renewal and real D1 concurrency still need owner-controlled verification after separate deployment approval.
 - An opt-in `signed_proxy` assertion verifier was added and locally tested with synthetic keys/subjects, key rotation, zero-D1/zero-provider rejection, OAuth start/manual completion subject binding, status, MCP requests, and public-origin links behind an internal hostname. A separate fail-closed gateway boundary reference now has synthetic tests for adapter separation, CSRF on side-effecting GETs, assertion signing/header replacement, body limits, routes and redirects. Neither supplies real login/MCP OAuth adapters or production topology. Real browser sessions, CSRF integration, end-to-end New Relic redirect, provider token issuance, and real-user isolation remain unverified; do not expose it as a multi-user public service until operator adapters are implemented and independently reviewed.
-- Write/destructive approval workflow is not implemented, and those operations remain disabled.
-- An operation approval design is documented, but it is not an implementation or authorization to enable writes.
+- Production write/destructive approval is not implemented, and those operations remain disabled. The browser-only rehearsal is not an authorization or implementation for live writes.
+- An operation approval design is documented, but the synthetic rehearsal does not make it production-ready or authorize enabling writes.
 - Connection status surfaces now inspect local D1 metadata only and do not refresh tokens or contact New Relic. A token refresh is attempted only when an explicit New Relic-backed operation runs; the exact live OAuth failure code remains unknown.
 - The connection page labels saved credentials as unverified and keeps an explicit reconnect action available without first deleting them. Explicitly blank or invalid self-host auth mode configuration fails closed instead of falling back to Sites identity.
 - Explicitly initiated failures expose only a fixed allowlist of non-secret diagnostic codes in API/MCP responses. The code path was tested with mock OAuth responses; no live error code was retrieved and no code is persisted for local status checks.

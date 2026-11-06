@@ -301,10 +301,13 @@ try {
   assert.equal(networkCalls, 0, "write transport rejection happens before fetch");
 
   const workerSource = await readFile(new URL("../worker/index.js", import.meta.url), "utf8");
+  const workerBundle = await readFile(new URL("../dist/server/index.js", import.meta.url), "utf8");
   const pageSource = await readFile(new URL("../worker/page.html", import.meta.url), "utf8");
   const demoSource = await readFile(new URL("../examples/operation-approval/demo.mjs", import.meta.url), "utf8");
   const rehearsalSource = await readFile(new URL("../examples/operation-approval/rehearsal.mjs", import.meta.url), "utf8");
   assert.doesNotMatch(workerSource, /\/api\/operation-approval|write_official_mcp|execute_write_operation/);
+  assert.doesNotMatch(workerBundle, /demo_set_alert_threshold|MockApprovalStore|operation-approval\/demo/,
+    "the synthetic rehearsal must not be included in the production Worker bundle");
   assert.match(workerSource, /"operation_approval_not_implemented"/);
   assert.match(pageSource, /書き込み・破壊的操作/);
   assert.match(pageSource, /書き込みの承認にはなりません/);
