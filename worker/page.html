@@ -124,6 +124,12 @@
         </form>
       </section>
 
+      <section class="card" aria-labelledby="operations-title">
+        <h2 id="operations-title">書き込み・破壊的操作</h2>
+        <p>このバージョンでは、New Relicのアラート、しきい値、ルーティング、エンティティなどを変更する操作は提供していません。利用カテゴリごとの許可は読み取りだけに適用され、書き込みの承認にはなりません。</p>
+        <p class="hint">将来の変更操作には、対象と影響の表示、本人による期限付きの1回限りの承認、リプレイ防止、接続変更時の失効が別途必要です。ここから操作を申請・実行することはできません。</p>
+      </section>
+
       <p class="note"><strong>使い方：</strong>接続とアカウント選択の後は、iPhone版ChatGPTの通常チャットで「ScyllaDBの直近30分を調べて」のように頼めます。アカウントIDやNRQLを毎回入力する必要はありません。</p>
       <p class="note"><strong>利用量：</strong>Core ComputeとAdvanced Computeは別カテゴリです。通常の読み取りはCoreの許可だけで使えます。New RelicのAI分析にはAdvanced Compute用の許可が別に必要です。これは課金方法や利用権の判定ではありません。</p>
       <footer>ChatGPT Sites MCP · New Relic公式MCPを読み取り専用で利用 · ログやチャットへOAuthトークンを出力しません</footer>

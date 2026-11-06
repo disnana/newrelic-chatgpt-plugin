@@ -44,6 +44,7 @@ const SAFE_DIAGNOSTIC_CODES = new Set([
   "invalid_token_response", "credential_storage_error", "connection_changed", "refresh_busy",
   "access_token_rejected", "access_token_rejected_after_refresh", "permission_denied",
   "provider_rate_limited", "invalid_mcp_response", "legacy_tool_billing_unverified",
+  "operation_approval_not_implemented",
   "usage_consent_required", "advanced_compute_consent_required", "preview_consent_required",
 ]);
 const JSON_HEADERS = {

@@ -818,8 +818,19 @@ async function callRemoteTool(session, toolName, values = {}, raw = false, rawPo
       );
     }
   } else {
-    if (!rawPolicy || rawPolicy.operation !== "read"
-      || !["core_compute", "advanced_compute"].includes(rawPolicy.billing)
+    if (!rawPolicy) {
+      throw new NewRelicRemoteError(
+        "汎用MCPの送信には審査済みの読み取りポリシーが必要です。",
+        "legacy_tool_billing_unverified",
+      );
+    }
+    if (["write", "destructive"].includes(rawPolicy.operation)) {
+      throw new NewRelicRemoteError(
+        "書き込み・破壊的操作はこのバージョンでは利用できません。操作ごとの本人承認は未実装です。",
+        "operation_approval_not_implemented",
+      );
+    }
+    if (rawPolicy.operation !== "read" || !["core_compute", "advanced_compute"].includes(rawPolicy.billing)
       || typeof rawPolicy.preview !== "boolean") {
       throw new NewRelicRemoteError(
         "汎用MCPの送信には課金区分・Preview区分を含む審査済み読み取りポリシーが必要です。",
