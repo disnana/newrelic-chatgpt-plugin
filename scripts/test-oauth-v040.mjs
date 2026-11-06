@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { webcrypto } from "node:crypto";
 import { encryptSecret, decryptSecret, getConnectionStatus, withNewRelicSession, callNewRelicRawTool, callNewRelicTool } from "../worker/newrelic.js";
+import { updateUsageConsents } from "../worker/usage-consent.js";
 globalThis.crypto ||= webcrypto;
 class MemoryD1 {
   states = new Map();
   connections = new Map();
   rates = new Map();
   locks = new Map();
+  consents = new Map();
 
   prepare(query) {
     const normalized = query.replace(/\s+/g, " ").trim().toUpperCase();
@@ -16,10 +18,26 @@ class MemoryD1 {
       bind(...values) { this.values = values; return this; },
       async run() { return database.run(normalized, this.values); },
       async first() { return database.first(normalized, this.values); },
+      async all() { return database.all(normalized, this.values); },
     };
   }
 
+  async batch(statements) {
+    const results = [];
+    for (const statement of statements) results.push(await statement.run());
+    return results;
+  }
+
   async run(query, values) {
+    if (query.startsWith("INSERT INTO NR_USAGE_CONSENTS")) {
+      const [user_id, capability, granted_at, expires_at] = values;
+      this.consents.set(user_id + ":" + capability, { user_id, capability, granted_at, expires_at });
+      return { meta: { changes: 1 } };
+    }
+    if (query.startsWith("DELETE FROM NR_USAGE_CONSENTS WHERE USER_ID = ? AND CAPABILITY = ?")) {
+      const changed = this.consents.delete(values[0] + ":" + values[1]);
+      return { meta: { changes: changed ? 1 : 0 } };
+    }
     if (query.startsWith("INSERT INTO NR_REFRESH_LOCKS")) {
       const [userId, owner, expires, now] = values;
       const prior = this.locks.get(userId);
@@ -85,6 +103,13 @@ class MemoryD1 {
       return this.rates.get(userId + ":" + windowStart) || null;
     }
     throw new Error("Unexpected mock D1 first query: " + query);
+  }
+
+  async all(query, values) {
+    if (query.includes("FROM NR_USAGE_CONSENTS WHERE USER_ID = ?")) {
+      return { results: [...this.consents.values()].filter(row => row.user_id === values[0]).map(row => ({ ...row })) };
+    }
+    throw new Error("Unexpected mock D1 all query: " + query);
   }
 }
 
@@ -171,8 +196,8 @@ await test("second 401 after refresh requires reconnect",async()=>{
  await assert.rejects(()=>withNewRelicSession(env,user,()=>"unreachable"),e=>e.code==="access_token_rejected_after_refresh"&&e.requiresReauthentication===true&&e.refreshable===false);
  assert.equal(refreshes,1);assert.equal(initializes,2);
 });
-await test("potentially metered legacy reads are disabled by default",async()=>{
- const env=await fixture(Date.now()+120000);let toolCalls=0;
+await test("Core Compute legacy reads require explicit per-user consent",async()=>{
+ const env={...(await fixture(Date.now()+120000)),NEW_RELIC_ENABLE_METERED_READS:"true"};let toolCalls=0;
  globalThis.fetch=async(_url,o)=>{
   const p=JSON.parse(o.body);
   if(p.method==="notifications/initialized")return new Response(null,{status:202});
@@ -181,11 +206,11 @@ await test("potentially metered legacy reads are disabled by default",async()=>{
   if(p.method==="tools/call"){toolCalls++;return Response.json({jsonrpc:"2.0",id:p.id,result:{content:[{type:"text",text:"accounts"}]}})}
   throw new Error("unexpected method");
  };
- await assert.rejects(()=>withNewRelicSession(env,user,session=>callNewRelicTool(session,"list_available_new_relic_accounts",{})),e=>e.code==="metered_reads_disabled");
+ await assert.rejects(()=>withNewRelicSession(env,user,session=>callNewRelicTool(session,"list_available_new_relic_accounts",{})),e=>e.code==="usage_consent_required");
  assert.equal(toolCalls,0,"a disabled read must not reach tools/call");
 });
 await test("metered legacy reads run only after explicit opt-in",async()=>{
- const env={...(await fixture(Date.now()+120000)),NEW_RELIC_ENABLE_METERED_READS:"true"};let toolCalls=0;
+ const env=await fixture(Date.now()+120000);await updateUsageConsents(env,user,{core_compute:true,advanced_compute:false,preview:false});let toolCalls=0;
  globalThis.fetch=async(_url,o)=>{
   const p=JSON.parse(o.body);
   if(p.method==="notifications/initialized")return new Response(null,{status:202});
@@ -197,13 +222,71 @@ await test("metered legacy reads run only after explicit opt-in",async()=>{
  await withNewRelicSession(env,user,session=>callNewRelicTool(session,"list_available_new_relic_accounts",{}));
  assert.equal(toolCalls,1);
 });
+await test("revocation during MCP discovery blocks an unsent legacy read",async()=>{
+ const env=await fixture(Date.now()+120000);await updateUsageConsents(env,user,{core_compute:true,advanced_compute:false,preview:false});let toolCalls=0;
+ globalThis.fetch=async(_url,o)=>{
+  const p=JSON.parse(o.body);
+  if(p.method==="notifications/initialized")return new Response(null,{status:202});
+  if(p.method==="initialize")return Response.json({jsonrpc:"2.0",id:p.id,result:{}});
+  if(p.method==="tools/list"){
+   await updateUsageConsents(env,user,{core_compute:false,advanced_compute:false,preview:false});
+   return Response.json({jsonrpc:"2.0",id:p.id,result:{tools:[{name:"list_available_new_relic_accounts",inputSchema:{type:"object",properties:{},additionalProperties:false}}]}});
+  }
+  if(p.method==="tools/call"){toolCalls++;return Response.json({jsonrpc:"2.0",id:p.id,result:{content:[{type:"text",text:"accounts"}]}})}
+  throw new Error("unexpected method");
+ };
+ await assert.rejects(()=>withNewRelicSession(env,user,session=>callNewRelicTool(session,"list_available_new_relic_accounts",{})),e=>e.code==="usage_consent_required");
+ assert.equal(toolCalls,0,"revoked consent is re-read immediately before the provider call");
+});
+await test("expiry during MCP discovery blocks an unsent legacy read",async()=>{
+ const env=await fixture(Date.now()+120000);await updateUsageConsents(env,user,{core_compute:true,advanced_compute:false,preview:false});let toolCalls=0;
+ globalThis.fetch=async(_url,o)=>{
+  const p=JSON.parse(o.body);
+  if(p.method==="notifications/initialized")return new Response(null,{status:202});
+  if(p.method==="initialize")return Response.json({jsonrpc:"2.0",id:p.id,result:{}});
+  if(p.method==="tools/list"){
+   const row=env.DB.consents.get(user+":core_compute");row.expires_at=Date.now()-1;
+   return Response.json({jsonrpc:"2.0",id:p.id,result:{tools:[{name:"list_available_new_relic_accounts",inputSchema:{type:"object",properties:{},additionalProperties:false}}]}});
+  }
+  if(p.method==="tools/call"){toolCalls++;return Response.json({jsonrpc:"2.0",id:p.id,result:{content:[{type:"text",text:"accounts"}]}})}
+  throw new Error("unexpected method");
+ };
+ await assert.rejects(()=>withNewRelicSession(env,user,session=>callNewRelicTool(session,"list_available_new_relic_accounts",{})),e=>e.code==="usage_consent_required");
+ assert.equal(toolCalls,0,"expired consent is not accepted from a stale session snapshot");
+});
+await test("revocation between legacy reads blocks the next call",async()=>{
+ const env=await fixture(Date.now()+120000);await updateUsageConsents(env,user,{core_compute:true,advanced_compute:false,preview:false});let toolCalls=0;
+ globalThis.fetch=async(_url,o)=>{
+  const p=JSON.parse(o.body);
+  if(p.method==="notifications/initialized")return new Response(null,{status:202});
+  if(p.method==="initialize")return Response.json({jsonrpc:"2.0",id:p.id,result:{}});
+  if(p.method==="tools/list")return Response.json({jsonrpc:"2.0",id:p.id,result:{tools:[
+   {name:"list_available_new_relic_accounts",inputSchema:{type:"object",properties:{},additionalProperties:false}},
+   {name:"execute_nrql_query",inputSchema:{type:"object",properties:{},additionalProperties:false}},
+  ]}});
+  if(p.method==="tools/call"){
+   toolCalls++;
+   await updateUsageConsents(env,user,{core_compute:false,advanced_compute:false,preview:false});
+   return Response.json({jsonrpc:"2.0",id:p.id,result:{content:[{type:"text",text:"ok"}]}});
+  }
+  throw new Error("unexpected method");
+ };
+ await assert.rejects(()=>withNewRelicSession(env,user,async session=>{
+  await callNewRelicTool(session,"list_available_new_relic_accounts",{});
+  await callNewRelicTool(session,"execute_nrql_query",{});
+ }),e=>e.code==="usage_consent_required");
+ assert.equal(toolCalls,1,"a multi-step investigation stops at the first read after revocation");
+});
 await test("legacy AI tools require Advanced Compute opt-in",async()=>{
- const env={...(await fixture(Date.now()+120000)),NEW_RELIC_ENABLE_METERED_READS:"true"};
+ const env={...(await fixture(Date.now()+120000)),NEW_RELIC_ENABLE_ADVANCED_COMPUTE:"true"};
  globalThis.fetch=async(_url,o)=>mcpResponse(o,[{name:"analyze_deployment_impact",inputSchema:{type:"object",properties:{},additionalProperties:false}}]);
- await assert.rejects(()=>withNewRelicSession(env,user,s=>callNewRelicTool(s,"analyze_deployment_impact",{})),e=>e.code==="advanced_compute_opt_in_required");
+ await assert.rejects(()=>withNewRelicSession(env,user,s=>callNewRelicTool(s,"analyze_deployment_impact",{})),e=>e.code==="advanced_compute_consent_required");
+ await updateUsageConsents(env,user,{core_compute:false,advanced_compute:true,preview:false});
+ await withNewRelicSession(env,user,s=>callNewRelicTool(s,"analyze_deployment_impact",{}));
 });
 await test("unclassified legacy tools remain blocked after Core opt-in",async()=>{
- const env={...(await fixture(Date.now()+120000)),NEW_RELIC_ENABLE_METERED_READS:"true"};
+ const env=await fixture(Date.now()+120000);
+ await updateUsageConsents(env,user,{core_compute:true,advanced_compute:false,preview:false});
  globalThis.fetch=async(_url,o)=>mcpResponse(o,[{name:"future_unknown_tool",inputSchema:{type:"object",properties:{},additionalProperties:false}}]);
  await assert.rejects(()=>withNewRelicSession(env,user,s=>callNewRelicTool(s,"future_unknown_tool",{})),e=>e.code==="legacy_tool_billing_unverified");
 });
@@ -220,8 +303,14 @@ await test("response id mismatch fails closed",async()=>{
  await assert.rejects(()=>withNewRelicSession(env,user,()=>null),e=>e.code==="invalid_mcp_response");
 });
 await test("raw exact arguments and no restrictive discovery tags",async()=>{
- const env=await fixture(Date.now()+120000);let args;globalThis.fetch=async(_url,o)=>{assert.equal(new Headers(o.headers).get("include-tags"),null);const p=JSON.parse(o.body);if(p.method==="tools/call")args=p.params.arguments;return mcpResponse(o,[{name:"get_entity",inputSchema:{type:"object"}}])};
- await withNewRelicSession(env,user,s=>callNewRelicRawTool(s,"get_entity",{entity_guid:"fixture"}));assert.deepEqual(args,{entity_guid:"fixture"});
+ const env=await fixture(Date.now()+120000);await updateUsageConsents(env,user,{core_compute:true,advanced_compute:false,preview:false});let args;globalThis.fetch=async(_url,o)=>{assert.equal(new Headers(o.headers).get("include-tags"),null);const p=JSON.parse(o.body);if(p.method==="tools/call")args=p.params.arguments;return mcpResponse(o,[{name:"get_entity",inputSchema:{type:"object"}}])};
+ await withNewRelicSession(env,user,s=>callNewRelicRawTool(s,"get_entity",{entity_guid:"fixture"},{operation:"read",billing:"core_compute",preview:false}));assert.deepEqual(args,{entity_guid:"fixture"});
+});
+await test("raw transport rejects missing billing policy before tools/call",async()=>{
+ const env=await fixture(Date.now()+120000);let toolCalls=0;
+ globalThis.fetch=async(_url,o)=>{const p=JSON.parse(o.body);if(p.method==="tools/call")toolCalls++;return mcpResponse(o,[{name:"get_entity",inputSchema:{type:"object"}}])};
+ await assert.rejects(()=>withNewRelicSession(env,user,s=>callNewRelicRawTool(s,"get_entity",{entity_guid:"fixture"})),e=>e.code==="legacy_tool_billing_unverified");
+ assert.equal(toolCalls,0,"the internal raw transport requires an explicit reviewed policy");
 });
 await test("transient OAuth failure recovers on later request",async()=>{
  const env=await fixture();globalThis.fetch=async()=>new Response(null,{status:503});

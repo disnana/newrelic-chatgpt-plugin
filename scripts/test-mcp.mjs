@@ -13,6 +13,7 @@ const { normalizeNrql, buildComparisonNrql, validateLogFilter, validateLogWindow
 const { schemaFingerprint } = await import(pathToFileURL(resolve(root, "worker/mcp-policy.js")).href + "?test=" + Date.now());
 const { beginNewRelicAuthorization, completePastedNewRelicAuthorization, disconnectNewRelic, decryptSecret, encryptSecret, siteUserId, getConnectionStatus, withNewRelicSession, findNewRelicTool } =
   await import(pathToFileURL(resolve(root, "worker/newrelic.js")).href + "?test=" + Date.now());
+const { updateUsageConsents } = await import(pathToFileURL(resolve(root, "worker/usage-consent.js")).href + "?test=" + Date.now());
 
 class MemoryD1 {
   states = new Map();
@@ -20,6 +21,7 @@ class MemoryD1 {
   preferences = new Map();
   rates = new Map();
   locks = new Map();
+  consents = new Map();
   operations = 0;
 
   prepare(query) {
@@ -31,6 +33,7 @@ class MemoryD1 {
       bind(...values) { this.values = values; return this; },
       async run() { return database.run(normalized, this.values); },
       async first() { return database.first(normalized, this.values); },
+      async all() { return database.all(normalized, this.values); },
     };
   }
 
@@ -44,6 +47,15 @@ class MemoryD1 {
   }
 
   async run(query, values) {
+    if (query.startsWith("INSERT INTO NR_USAGE_CONSENTS")) {
+      const [user_id, capability, granted_at, expires_at] = values;
+      this.consents.set(user_id + ":" + capability, { user_id, capability, granted_at, expires_at });
+      return { meta: { changes: 1 } };
+    }
+    if (query.startsWith("DELETE FROM NR_USAGE_CONSENTS WHERE USER_ID = ? AND CAPABILITY = ?")) {
+      const changed = this.consents.delete(values[0] + ":" + values[1]);
+      return { meta: { changes: changed ? 1 : 0 } };
+    }
     if (query.startsWith("INSERT INTO NR_REFRESH_LOCKS")) {
       const [userId, owner, expires, now] = values;
       const prior = this.locks.get(userId);
@@ -141,6 +153,13 @@ class MemoryD1 {
       return this.rates.get(userId + ":" + windowStart) || null;
     }
     throw new Error("Unexpected mock D1 first query: " + query);
+  }
+
+  async all(query, values) {
+    if (query.includes("FROM NR_USAGE_CONSENTS WHERE USER_ID = ?")) {
+      return { results: [...this.consents.values()].filter(row => row.user_id === values[0]).map(row => ({ ...row })) };
+    }
+    throw new Error("Unexpected mock D1 all query: " + query);
   }
 }
 
@@ -378,6 +397,9 @@ const signedInternalConnect = await worker.fetch(new Request("https://worker.int
 const signedInternalConnectPayload = await signedInternalConnect.json();
 assert.equal(new URL(signedInternalConnectPayload.result.structuredContent.connectUrl).origin, "https://example.test",
   "self-host authorization links use the configured external origin behind a reverse proxy");
+assert.equal(new URL(signedInternalConnectPayload.result.structuredContent.connectUrl).pathname, "/",
+  "ChatGPT connect links go to the safe landing page, not a cross-site side-effecting OAuth GET");
+assert.equal(new URL(signedInternalConnectPayload.result.structuredContent.connectUrl).searchParams.get("connect_region"), "jp");
 const signedInternalDisconnect = await worker.fetch(new Request("https://worker.internal/mcp", {
   method: "POST",
   headers: { "content-type": "application/json", authorization: "Bearer " + ownerJwt, origin: "https://example.test" },
@@ -520,6 +542,7 @@ class FakeElement {
   dataset = {};
   classList = { add() {}, remove() {} };
   disabled = false;
+  checked = false;
   hidden = false;
   textContent = "";
   href = "";
@@ -535,16 +558,28 @@ const fakeDocument = {
   createElement() { return new FakeElement(); },
 };
 const uiRequests = [];
+const uiRequestOptions = [];
 let rejectAccountList = false;
 let rejectAccountSelection = false;
-const fakeFetch = async path => {
+const fakeFetch = async (path, options = {}) => {
   uiRequests.push(path);
+  uiRequestOptions.push(options);
   if (path === "/api/status") return Response.json({
     authenticated: true, connected: true, connectedAt: Date.now(), region: "us",
     selectedAccount: { id: "account-second", name: "Second account" },
-    meteredReadsEnabled: true, tokenRefreshDue: false, requiresReauthentication: false,
+    tokenRefreshDue: false, requiresReauthentication: false,
     refreshError: null, providerReachable: null, statusSource: "local_metadata",
   });
+  if (path === "/api/usage-consent" && (!options.method || options.method === "GET")) return Response.json({ usageConsents: {
+    core_compute: { enabled: true, expiresAt: Date.now() + 100000 },
+    advanced_compute: { enabled: false, expiresAt: null },
+    preview: { enabled: false, expiresAt: null },
+  } });
+  if (path === "/api/usage-consent" && options.method === "POST") return Response.json({ usageConsents: {
+    core_compute: { enabled: true, expiresAt: Date.now() + 100000 },
+    advanced_compute: { enabled: false, expiresAt: null },
+    preview: { enabled: false, expiresAt: null },
+  } });
   if (path === "/api/accounts") {
     if (rejectAccountList) return Response.json({ error: "New Relic access requires reauthentication", errorCode: "oauth_invalid_grant" }, { status: 401 });
     return Response.json({
@@ -558,18 +593,25 @@ const fakeFetch = async path => {
   throw new Error("Unexpected UI request " + path);
 };
 runInNewContext(page.match(/<script>([\s\S]*?)<\/script>/)[1], {
-  document: fakeDocument, fetch: fakeFetch, Response, Date, setTimeout,
+  document: fakeDocument, fetch: fakeFetch, Response, Date, URL,
+  window: { location: { href: "https://example.test/" } }, setTimeout,
 });
 await new Promise(resolve => setTimeout(resolve, 0));
-assert.deepEqual(uiRequests, ["/api/status"], "status view must not auto-fetch accounts even after metered reads are enabled");
+assert.deepEqual(uiRequests, ["/api/status", "/api/usage-consent"], "status view may read consent metadata, but must not auto-fetch New Relic account data");
+assert.equal(uiElements.get("#consent-core").checked, true);
+assert.equal(uiElements.get("#consent-advanced").checked, false, "Advanced remains a separate consent");
 assert.equal(uiElements.get("#reconnect-link").href, "/oauth/start?region=us");
 assert.match(uiElements.get("#connection-detail").textContent, /有効性・到達性は未確認/);
 await uiElements.get("#load-accounts").listeners.click();
-assert.deepEqual(uiRequests, ["/api/status", "/api/accounts"]);
+assert.deepEqual(uiRequests, ["/api/status", "/api/usage-consent", "/api/accounts"]);
 assert.equal(uiElements.get("#account").children[0].selected, false);
 assert.equal(uiElements.get("#account").children[1].selected, true,
   "the saved account remains selected even when it is not the first listed account");
 assert.equal(uiElements.get("#select-account").disabled, false);
+uiElements.get("#consent-advanced").checked = true;
+await uiElements.get("#usage-form").listeners.submit({ preventDefault() {} });
+assert.equal(uiRequests.at(-1), "/api/usage-consent");
+assert.equal(JSON.parse(uiRequestOptions.at(-1).body).advanced_compute, true, "the UI sends the user's explicit Advanced choice");
 uiElements.get("#account").value = "account-second";
 rejectAccountSelection = true;
 await uiElements.get("#select-account").listeners.click();
@@ -581,6 +623,30 @@ assert.match(uiElements.get("#account-hint").textContent, /reauthentication/);
 assert.match(uiElements.get("#account-hint").textContent, /oauth_invalid_grant/);
 assert.equal(uiElements.get("#reconnect-link").href, "/oauth/start?region=us",
   "provider reauthentication errors must leave a reconnect action available without deleting local credentials");
+const disconnectedUiElements = new Map();
+const disconnectedDocument = {
+  querySelector(selector) {
+    if (!disconnectedUiElements.has(selector)) disconnectedUiElements.set(selector, new FakeElement());
+    return disconnectedUiElements.get(selector);
+  },
+  createElement() { return new FakeElement(); },
+};
+const disconnectedRequests = [];
+runInNewContext(page.match(/<script>([\s\S]*?)<\/script>/)[1], {
+  document: disconnectedDocument,
+  fetch: async path => {
+    disconnectedRequests.push(path);
+    return Response.json({ authenticated: true, connected: false });
+  },
+  Response, Date, URL,
+  window: { location: { href: "https://example.test/?connect_region=jp" } },
+  setTimeout,
+});
+await new Promise(resolve => setTimeout(resolve, 0));
+assert.deepEqual(disconnectedRequests, ["/api/status", "/api/usage-consent"]);
+assert.equal(disconnectedUiElements.get("#region").value, "jp");
+assert.equal(disconnectedUiElements.get("#connect-link").href, "/oauth/start?region=jp",
+  "a safe landing URL restores the requested region without starting OAuth automatically");
 const statusWithoutIdentity = await worker.fetch(new Request("https://example.test/api/status"), {});
 assert.equal(statusWithoutIdentity.status, 200);
 assert.equal((await statusWithoutIdentity.json()).authenticated, false);
@@ -767,9 +833,33 @@ try {
   assert.equal(upstreamToolCalls, 0, "unreviewed generic requests must not perform hidden account-list calls");
 
   const schemaHash = await schemaFingerprint(readTool);
-  const reviewedEnv = { ...oauthEnv, NEW_RELIC_MCP_POLICIES: JSON.stringify({ fixture_read: {
+  const reviewedWithoutConsentEnv = { ...oauthEnv, NEW_RELIC_MCP_POLICIES: JSON.stringify({ fixture_read: {
     schemaHash, operation: "read", billing: "core_compute", preview: false, scope: "identity",
-  } }), NEW_RELIC_ENABLE_METERED_READS: "true" };
+  } }) };
+  const noConsent = await call("tools/call", { name: "read_official_mcp", arguments: { toolName: "fixture_read", arguments: {} } }, reviewedWithoutConsentEnv, identity);
+  assert.match(noConsent.payload.result.content[0].text, /usage_consent_required/);
+  assert.equal(noConsent.payload.result.structuredContent.errorCode, "usage_consent_required");
+  assert.equal(upstreamToolCalls, 0, "a Core policy cannot run before the user's independent consent");
+  await updateUsageConsents(oauthEnv, userId, { core_compute: true, advanced_compute: false, preview: false });
+  const reviewedEnv = reviewedWithoutConsentEnv;
+  globalThis.fetch = async (_url, options) => {
+    const request = JSON.parse(options.body);
+    if (request.method === "notifications/initialized") return new Response(null, { status: 202 });
+    if (request.method === "initialize") return Response.json({ jsonrpc: "2.0", id: request.id, result: {} });
+    if (request.method === "tools/list") {
+      await updateUsageConsents(oauthEnv, userId, { core_compute: false, advanced_compute: false, preview: false });
+      return Response.json({ jsonrpc: "2.0", id: request.id, result: { tools: [readTool] } });
+    }
+    if (request.method === "tools/call") {
+      upstreamToolCalls += 1;
+      return Response.json({ jsonrpc: "2.0", id: request.id, result: { content: [{ type: "text", text: "fixture" }] } });
+    }
+    throw new Error("Unexpected MCP method " + request.method);
+  };
+  const revokedDuringDiscovery = await call("tools/call", { name: "read_official_mcp", arguments: { toolName: "fixture_read", arguments: {} } }, reviewedEnv, identity);
+  assert.equal(revokedDuringDiscovery.payload.result.structuredContent.errorCode, "usage_consent_required");
+  assert.equal(upstreamToolCalls, 0, "generic reads recheck the current grant immediately before dispatch");
+  await updateUsageConsents(oauthEnv, userId, { core_compute: true, advanced_compute: false, preview: false });
   globalThis.fetch = async (_url, options) => {
     const request = JSON.parse(options.body);
     if (request.method === "notifications/initialized") return new Response(null, { status: 202 });
@@ -896,6 +986,56 @@ assert.equal(statusRefreshCalls, 0, "status lookups must not refresh tokens or c
 assert.equal(statusDb.rates.get(statusUserId + ":" + Math.floor(Date.now() / 60000)).call_count, 25);
 globalThis.fetch = originalFetch;
 
+const consentDb = new MemoryD1();
+const consentIdentity = "usage-consent-owner";
+const consentUserId = await siteUserId(new Request("https://example.test/", {
+  headers: { "oai-authenticated-user-id": consentIdentity },
+}));
+const consentChoices = { core_compute: true, advanced_compute: false, preview: false };
+const consentRequest = (method = "GET", body, origin = "https://example.test", identity = consentIdentity) => new Request("https://example.test/api/usage-consent", {
+  method,
+  headers: {
+    ...(method === "POST" ? { "content-type": "application/json" } : {}),
+    ...(origin ? { origin } : {}),
+    "oai-authenticated-user-id": identity,
+  },
+  ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+});
+const emptyConsentResponse = await worker.fetch(consentRequest(), { ...env, DB: consentDb });
+assert.deepEqual((await emptyConsentResponse.json()).usageConsents, {
+  core_compute: { enabled: false, expiresAt: null },
+  advanced_compute: { enabled: false, expiresAt: null },
+  preview: { enabled: false, expiresAt: null },
+}, "usage permissions are off for a new user");
+assert.equal((await worker.fetch(consentRequest("POST", consentChoices, null), { ...env, DB: consentDb })).status, 403,
+  "grant and revoke require a same-origin browser request");
+assert.equal((await worker.fetch(consentRequest("POST", { ...consentChoices, extra: true }), { ...env, DB: consentDb })).status, 400,
+  "unknown consent fields are rejected");
+const grantResponse = await worker.fetch(consentRequest("POST", consentChoices), { ...env, DB: consentDb });
+assert.equal(grantResponse.status, 200);
+const grantedConsent = (await grantResponse.json()).usageConsents;
+assert.equal(grantedConsent.core_compute.enabled, true);
+assert.equal(grantedConsent.advanced_compute.enabled, false, "Core consent does not enable Advanced");
+assert.ok(grantedConsent.core_compute.expiresAt > Date.now() + 29 * 24 * 60 * 60 * 1000,
+  "explicit consent expires in 30 days");
+const otherIdentityConsent = await worker.fetch(consentRequest("GET", undefined, "https://example.test", "different-consent-user"), { ...env, DB: consentDb });
+assert.equal((await otherIdentityConsent.json()).usageConsents.core_compute.enabled, false,
+  "consent is isolated per authenticated user");
+const expiredIdentity = "expired-consent-identity";
+const expiredUserId = await siteUserId(new Request("https://example.test/", {
+  headers: { "oai-authenticated-user-id": expiredIdentity },
+}));
+consentDb.consents.set(expiredUserId + ":core_compute", {
+  user_id: expiredUserId, capability: "core_compute", granted_at: 1, expires_at: Date.now() - 1,
+});
+const expiredConsentResponse = await worker.fetch(consentRequest("GET", undefined, "https://example.test", expiredIdentity), { ...env, DB: consentDb });
+assert.equal((await expiredConsentResponse.json()).usageConsents.core_compute.enabled, false,
+  "expired grants are not effective");
+const revokeResponse = await worker.fetch(consentRequest("POST", { ...consentChoices, core_compute: false }), { ...env, DB: consentDb });
+assert.equal((await revokeResponse.json()).usageConsents.core_compute.enabled, false,
+  "the owner can revoke consent from the same UI");
+assert.equal(consentDb.consents.has(consentUserId + ":core_compute"), false);
+
 // OAuth and ordinary status/read traffic use separate quota buckets.
 const quotaDb = new MemoryD1();
 for (let index = 0; index < 5; index += 1) {
@@ -949,6 +1089,7 @@ selectionDb.connections.set(selectionUserId, {
   connected_at: Date.now(),
   region: "jp",
 });
+await updateUsageConsents({ ...env, DB: selectionDb }, selectionUserId, { core_compute: true, advanced_compute: false, preview: false });
 globalThis.fetch = async (_url, options) => {
   const request = JSON.parse(options.body);
   if (request.method === "notifications/initialized") return new Response(null, { status: 202 });
@@ -969,7 +1110,7 @@ const selectionResponse = await worker.fetch(new Request("https://example.test/a
     "oai-authenticated-user-id": selectionIdentity,
   },
   body: JSON.stringify({ accountId: "123" }),
-}), { ...env, DB: selectionDb, NEW_RELIC_ENABLE_METERED_READS: "true" });
+}), { ...env, DB: selectionDb });
 const selectionRaw = await selectionResponse.text();
 assert.equal(selectionResponse.status, 200);
 assert.ok(new TextEncoder().encode(selectionRaw).byteLength <= 10000, "provider account names must be bounded before selection responses");

@@ -119,7 +119,7 @@ export function readPolicies(env) {
     return policies;
   } catch { fail('invalid_policy_configuration'); }
 }
-export async function capabilityCatalog(tools,env) {
+export async function capabilityCatalog(tools,env,usageConsents={}) {
   const policies=readPolicies(env);
   const names=new Set();
   const rows=[];
@@ -139,9 +139,9 @@ export async function capabilityCatalog(tools,env) {
       else if(policy.schemaHash!==fingerprint) reason='schema_changed_review_required';
       else if(policy.operation!=='read') reason='operation_approval_not_implemented';
       else if(policy.billing==='unknown') reason='billing_unverified';
-      else if(policy.billing==='core_compute' && env?.NEW_RELIC_ENABLE_METERED_READS!=='true') reason='metered_reads_disabled';
-      else if(policy.billing==='advanced_compute' && env?.NEW_RELIC_ENABLE_ADVANCED_COMPUTE!=='true') reason='advanced_compute_opt_in_required';
-      else if(policy.preview && env?.NEW_RELIC_ENABLE_PREVIEW!=='true') reason='preview_opt_in_required';
+      else if(policy.billing==='core_compute' && usageConsents.core_compute!==true) reason='usage_consent_required';
+      else if(policy.billing==='advanced_compute' && usageConsents.advanced_compute!==true) reason='advanced_compute_consent_required';
+      else if(policy.preview && usageConsents.preview!==true) reason='preview_consent_required';
     }
     rows.push({name:tool.name,description:String(tool.description??'').slice(0,1000),inputSchema:tool.inputSchema,
       schemaHash:fingerprint,available:reason===null,reason,operation:policy?.operation??'unknown',
@@ -149,9 +149,9 @@ export async function capabilityCatalog(tools,env) {
   }
   return rows;
 }
-export async function reviewReadTool(session, env, name, args) {
+export async function reviewReadTool(session, env, name, args, usageConsents={}) {
   if(typeof name!=='string'||!plain(args)) fail();
-  const row=(await capabilityCatalog(session.tools,env)).find(t=>t.name===name);
+  const row=(await capabilityCatalog(session.tools,env,usageConsents)).find(t=>t.name===name);
   if(!row) fail('tool_not_available');
   if(!row.available) fail(row.reason ?? 'tool_not_available');
   const policy=readPolicies(env)[name];
@@ -159,8 +159,8 @@ export async function reviewReadTool(session, env, name, args) {
   validateSchema(args,definition.inputSchema);
   return {definition,policy};
 }
-export async function authorizeReadTool(session, env, name, args, accountId, allowedAccountIds) {
-  const {definition,policy}=await reviewReadTool(session,env,name,args);
+export async function authorizeReadTool(session, env, name, args, accountId, allowedAccountIds, usageConsents={}) {
+  const {definition,policy}=await reviewReadTool(session,env,name,args,usageConsents);
   if(policy.scope==='account') {
     if(!accountId || !allowedAccountIds.includes(String(accountId))) fail('account_not_authorized');
     for(const key of policy.accountFields) {

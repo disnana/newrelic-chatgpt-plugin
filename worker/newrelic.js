@@ -7,6 +7,7 @@ const MCP_ENDPOINTS = {
   jp: "https://mcp.jp.newrelic.com/mcp/",
 };
 const MCP_PROTOCOL_VERSION = "2025-03-26";
+import { getUsageConsents } from "./usage-consent.js";
 const LEGACY_CORE_COMPUTE_TOOLS = new Set([
   "list_available_new_relic_accounts", "list_new_relic_accounts", "list_accounts",
   "list_metric_names", "search_metric_names",
@@ -481,7 +482,6 @@ export async function getConnectionStatus(env, userId, { refreshIfNeeded = false
     accessTokenExpiresAt: Number.isFinite(accessTokenExpiresAt) ? accessTokenExpiresAt : null,
     region: validRegion(currentConnection.region),
     selectedAccount: await getSelectedAccount(env, userId),
-    meteredReadsEnabled: env?.NEW_RELIC_ENABLE_METERED_READS === "true",
     tokenRefreshDue: !Number.isFinite(accessTokenExpiresAt) || accessTokenExpiresAt <= Date.now() + 30000,
     requiresReauthentication,
     refreshError,
@@ -794,20 +794,21 @@ function buildUpstreamArguments(tool, values) {
   return args;
 }
 
-async function callRemoteTool(session, toolName, values = {}, raw = false) {
+/** @param {any} session @param {string} toolName @param {Record<string, any>} values @param {boolean} raw @param {{operation: string, billing: string, preview: boolean} | null} rawPolicy */
+async function callRemoteTool(session, toolName, values = {}, raw = false, rawPolicy = null) {
   if (!raw) {
     if (LEGACY_CORE_COMPUTE_TOOLS.has(toolName)) {
-      if (session.allowMeteredReads !== true) {
+      if (!(await hasActiveUsageConsent(session, "core_compute"))) {
         throw new NewRelicRemoteError(
-          "この読み取りはNew Relic Core Compute (CCU) などの利用量が発生する可能性があるため既定で停止しています。Site管理者は契約と費用を確認したうえで、明示的な有効化が必要です。",
-          "metered_reads_disabled",
+          "Core Compute (CCU) の利用が記録される可能性があるため、この読み取りを送信していません。CCU計測だけでは追加料金の有無は分かりません。含まれるか別料金かはNew Relicの契約・料金モデルによりますが、この連携では確認できません。接続ページでCore Compute読み取りを明示的に許可してください。",
+          "usage_consent_required",
         );
       }
     } else if (LEGACY_ADVANCED_COMPUTE_TOOLS.has(toolName)) {
-      if (session.allowAdvancedCompute !== true) {
+      if (!(await hasActiveUsageConsent(session, "advanced_compute"))) {
         throw new NewRelicRemoteError(
-          "このAI分析はAdvanced Compute (aCCU) 契約を必要とするため、明示的な有効化まで停止しています。",
-          "advanced_compute_opt_in_required",
+          "このAI分析はAdvanced Compute (aCCU) 用です。利用には対応する契約または試用枠が必要です。利用権と料金条件はこの連携では確認できません。接続ページでAdvanced Computeの利用を明示的に許可してください。",
+          "advanced_compute_consent_required",
         );
       }
     } else {
@@ -816,6 +817,16 @@ async function callRemoteTool(session, toolName, values = {}, raw = false) {
         "legacy_tool_billing_unverified",
       );
     }
+  } else {
+    if (!rawPolicy || rawPolicy.operation !== "read"
+      || !["core_compute", "advanced_compute"].includes(rawPolicy.billing)
+      || typeof rawPolicy.preview !== "boolean") {
+      throw new NewRelicRemoteError(
+        "汎用MCPの送信には課金区分・Preview区分を含む審査済み読み取りポリシーが必要です。",
+        "legacy_tool_billing_unverified",
+      );
+    }
+    await assertActivePolicyConsent(session, rawPolicy);
   }
   session.callCount += 1;
   if (session.callCount > 8) {
@@ -843,6 +854,46 @@ async function callRemoteTool(session, toolName, values = {}, raw = false) {
   return result;
 }
 
+async function currentUsageConsentState(session) {
+  const state = typeof session.loadUsageConsentState === "function"
+    ? await session.loadUsageConsentState()
+    : (session.usageConsentState || {});
+  session.usageConsentState = state;
+  session.usageConsents = Object.fromEntries(Object.entries(state).map(([capability, consent]) => [capability, consent.enabled]));
+  return state;
+}
+
+async function hasActiveUsageConsent(session, capability) {
+  const consent = (await currentUsageConsentState(session))?.[capability];
+  return consent?.enabled === true && Number.isSafeInteger(consent.expiresAt) && consent.expiresAt > Date.now();
+}
+
+async function assertActivePolicyConsent(session, policy) {
+  const state = await currentUsageConsentState(session);
+  const active = (capability) => {
+    const consent = state?.[capability];
+    return consent?.enabled === true && Number.isSafeInteger(consent.expiresAt) && consent.expiresAt > Date.now();
+  };
+  if (policy?.billing === "core_compute" && !active("core_compute")) {
+    throw new NewRelicRemoteError(
+      "Core Compute利用許可が未設定か期限切れのため、この読み取りを送信していません。接続ページで許可を保存してください。",
+      "usage_consent_required",
+    );
+  }
+  if (policy?.billing === "advanced_compute" && !active("advanced_compute")) {
+    throw new NewRelicRemoteError(
+      "Advanced Compute利用許可が未設定か期限切れのため、この読み取りを送信していません。接続ページで個別に許可してください。",
+      "advanced_compute_consent_required",
+    );
+  }
+  if (policy?.preview === true && !active("preview")) {
+    throw new NewRelicRemoteError(
+      "Preview利用許可が未設定か期限切れのため、この読み取りを送信していません。接続ページで個別に許可してください。",
+      "preview_consent_required",
+    );
+  }
+}
+
 export async function withNewRelicSession(env, userId, callback, options = {}) {
   let lastError;
   let failedToken = null;
@@ -850,9 +901,13 @@ export async function withNewRelicSession(env, userId, callback, options = {}) {
     const auth = await accessToken(env, userId, attempt === 1, failedToken);
     const endpoint = MCP_ENDPOINTS[auth.region];
     try {
+      const usageConsentState = await getUsageConsents(env, userId);
+      const usageConsents = Object.fromEntries(Object.entries(usageConsentState)
+        .map(([capability, consent]) => [capability, consent.enabled]));
       const session = await startRemoteSession(endpoint, auth.token);
-      session.allowMeteredReads = env?.NEW_RELIC_ENABLE_METERED_READS === "true";
-      session.allowAdvancedCompute = env?.NEW_RELIC_ENABLE_ADVANCED_COMPUTE === "true";
+      session.usageConsents = usageConsents;
+      session.usageConsentState = usageConsentState;
+      session.loadUsageConsentState = () => getUsageConsents(env, userId);
       return await callback(session);
     } catch (error) {
       lastError = error;
@@ -875,8 +930,8 @@ export async function callNewRelicTool(session, toolName, values = {}) {
 
 // Only callers that have performed schema, policy, account and approval checks
 // may use this exact-argument transport. It is not exposed as an MCP tool.
-export async function callNewRelicRawTool(session, toolName, validatedArgs = {}) {
-  return callRemoteTool(session, toolName, validatedArgs, true);
+export async function callNewRelicRawTool(session, toolName, validatedArgs = {}, policy = null) {
+  return callRemoteTool(session, toolName, validatedArgs, true, policy);
 }
 
 export function findNewRelicTool(session, candidates) {

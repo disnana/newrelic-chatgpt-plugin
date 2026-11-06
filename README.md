@@ -14,17 +14,17 @@ Disnanaによる**非公式**のNew Relic連携です。各利用者が自分の
 - ScyllaDBのメトリクス・属性探索、期間比較
 - OAuth PKCE、暗号化保存、同時refresh制御、取得量の制限
 
-New Relic公式MCPの読み取り専用操作も Core Compute などの利用量を消費する可能性があるため、アカウント一覧・NRQL・メトリクス・ログ・アラート取得は既定で無効です。Site管理者が契約を確認して `NEW_RELIC_ENABLE_METERED_READS=true` を明示した場合だけ、「直近30分のログを調べて」のように利用できます。読み取り専用は無料を意味しません。メトリクス名やrack属性は実際の取得結果から確認し、推測で固定しません。
+New RelicのCore Compute利用量の計測と追加料金は同じ意味ではありません。実際に利用量が契約に含まれるか、別料金になるかはアカウントの料金モデルによりますが、この連携から契約を確認できません。Siteでは通常のCore読み取りを既定で停止し、接続ページの「利用カテゴリごとの許可」から本人が明示的に有効化できます。Advanced Compute (aCCU) のAI分析は別の許可と対応する契約・試用枠が必要です。許可は30日で期限切れになり、いつでも解除できます。読み取り専用は書き込み承認を含みません。メトリクス名やrack属性は実際の取得結果から確認し、推測で固定しません。
 
 ## 導入
 
 1. [最新Release](https://github.com/disnana/newrelic-chatgpt-plugin/releases/latest)から `NewRelic-ChatGPT-setup-vX.Y.Z.zip` と `checksums.txt` を取得し、SHA-256を照合する。**初回Release前はこのリンクからZIPを取得できません**。開発者は下記のローカル生成手順を使えます。
 2. ChatGPT Sitesが利用可能で、Worker・D1・MCPを作成できる環境を用意する。New Relic側ではMCP機能と組織の読み取り権限が必要です。
 3. ZIPをChatGPTへ添付し、[セットアップ文](docs/setup.md)を使って**新しい所有者限定Site**を作る。既存ユーザーのSiteやPluginは使用しません。
-4. `DB` binding、3つのD1 migration、MCP capabilityを設定する。Siteごとに独立した暗号鍵を安全に生成して `NEW_RELIC_TOKEN_ENCRYPTION_KEY` Secretに保存する。値をチャット・Git・ログに出力しません。利用量を伴う読み取りは既定で無効です。
+4. `DB` binding、4つのD1 migration、MCP capabilityを設定する。Siteごとに独立した暗号鍵を安全に生成して `NEW_RELIC_TOKEN_ENCRYPTION_KEY` Secretに保存する。値をチャット・Git・ログに出力しません。Core、Advanced、Previewの許可は既定ですべて無効です。
 5. 所有者限定でSiteを公開すると、Sitesが自分用Pluginを生成します。そのPluginを接続します。このソースZIP自体はPluginインポート用ZIPではありません。
 6. Siteでリージョンを選び、New Relic公式OAuthへ接続。localhostに戻ったURL全体を**Site内の認証完了ページ**に貼り付ける。認可URLはチャットに送信しません。
-7. アカウントを選択し、接続状態と読み取り専用クエリを確認する。終了時はSite内の接続解除を使う。New Relic側の認可取消しは別途必要です。
+7. Siteの利用カテゴリごとの許可を確認し、必要な読み取りだけを選択して保存します。Core許可を有効にすると、通常のNRQL・アカウント一覧・メトリクス・ログ・アラートなどを使えます。Advanced許可はaCCU向けAI分析の別設定です。許可だけではNew Relic側の利用権や請求条件を確認できません。アカウントを選択し、読み取り専用クエリを確認します。終了時はSite内の接続解除を使うほか、利用カテゴリの許可を解除できます。New Relic側の認可取消しは別途必要です。
 
 新しい第三者アカウントでの導入一式は未検証です。既存所有者環境での成功を、全ユーザー・全モバイル環境での動作保証と扱わないでください。Sitesの作成権限や表示はプラン・環境に依存します。
 
@@ -86,6 +86,6 @@ python3 scripts/package-release.py v0.4.0
 
 ## v0.4.0 development status
 
-OAuth failure classification, a fail-closed schema-pinned generic MCP adapter, and an opt-in signed-assertion verifier for an external self-host gateway are implemented. This is **not full official MCP parity**, and it does not include a login service or gateway. The documented inventory contains 41 tools, but authenticated live schemas and new runtime execution remain unverified (0 live-verified generic tools). Legacy Core Compute reads default to disabled and require `NEW_RELIC_ENABLE_METERED_READS=true`; generic Core Compute and Advanced Compute tools require a pinned policy plus the matching explicit opt-in. Preview adds its own opt-in. Write and destructive operations remain disabled because per-operation user approval is not implemented. The default identity mode remains ChatGPT Sites; self-host assertion mode is locally mocked only and must stay behind an independently reviewed gateway.
+OAuth failure classification, a fail-closed schema-pinned generic MCP adapter, expiring per-user consent for Core/Advanced/Preview reads, and an opt-in signed-assertion verifier for an external self-host gateway are implemented. A separate self-host gateway boundary reference is included, but it requires operator-supplied browser/MCP authentication and CSRF adapters and is not a login service or production-ready multi-user gateway. This is **not full official MCP parity**. The documented inventory contains 41 tools, but authenticated live schemas and new runtime execution remain unverified (0 live-verified generic tools). Core and Advanced reads are off until the user selects them in the Site; Core CCU measurement does not by itself prove an additional charge, and the account billing model cannot be verified by the integration. Advanced Compute remains separate and requires the corresponding entitlement or trial. Generic reads require a pinned policy and matching per-user consent. Write and destructive operations remain disabled because per-operation user approval is not implemented. The default identity mode remains ChatGPT Sites; self-host assertion mode and the reference wrapper are locally mocked only and must stay behind an independently reviewed gateway.
 
-See [migration and policy setup](docs/v0.4.0-migration.md), [self-host auth boundary](docs/self-host-auth.md), [operation approval design](docs/operation-approval-design.md), [official feature research](docs/official-mcp-research.md), [OAuth](docs/oauth.md), and [security review](docs/security-review.md). No production deployment is included.
+See [migration and policy setup](docs/v0.4.0-migration.md), [self-host auth boundary](docs/self-host-auth.md), [gateway reference](examples/self-host-gateway/README.md), [operation approval design](docs/operation-approval-design.md), [official feature research](docs/official-mcp-research.md), [OAuth](docs/oauth.md), and [security review](docs/security-review.md). No production deployment is included.

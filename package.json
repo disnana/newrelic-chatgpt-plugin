@@ -5,11 +5,11 @@
   "scripts": {
     "build": "bash scripts/build.sh",
     "validate": "node scripts/validate-artifact.mjs",
-    "test": "node scripts/test-mcp.mjs && node scripts/test-oauth-v040.mjs && node scripts/test-mcp-policy.mjs",
+    "test": "node scripts/test-mcp.mjs && node scripts/test-oauth-v040.mjs && node scripts/test-mcp-policy.mjs && node scripts/test-self-host-gateway.mjs",
     "check": "python3 scripts/check-distribution.py",
     "typecheck": "tsc --project tsconfig.json",
     "package": "python3 scripts/package-release.py",
-    "lint": "node --check worker/index.js && node --check worker/newrelic.js && node --check worker/mcp-policy.js && node --check worker/nrql.js"
+    "lint": "node --check worker/index.js && node --check worker/newrelic.js && node --check worker/mcp-policy.js && node --check worker/usage-consent.js && node --check worker/nrql.js && node --check examples/self-host-gateway/gateway.mjs && node --check scripts/test-self-host-gateway.mjs"
   },
   "version": "0.4.0",
   "license": "MIT",

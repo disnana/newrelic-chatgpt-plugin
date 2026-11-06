@@ -38,6 +38,10 @@
       .actions { display:flex; flex-wrap:wrap; gap:10px; margin-top:20px; }
       .actions button { flex:1 1 150px; }
       .hint { margin-top:14px !important; font-size:.9rem; }
+      .consent-option { margin-top:18px; padding:16px; border:1px solid var(--line); border-radius:14px; }
+      .consent-option label { display:flex; align-items:flex-start; gap:12px; color:var(--text); }
+      .consent-option input { width:20px; height:20px; margin:1px 0 0; accent-color:var(--accent); }
+      .consent-option p { margin:8px 0 0 32px; font-size:.92rem; }
       .error { color:var(--bad) !important; }
       .note { margin:20px 2px 0; padding:16px 18px; border-left:3px solid var(--accent); border-radius:0 12px 12px 0; background:var(--soft); color:var(--muted); line-height:1.65; }
       .note strong { color:var(--text); }
@@ -84,7 +88,7 @@
             <label for="account">使用するNew Relicアカウント
               <select id="account"></select>
             </label>
-            <button id="load-accounts" type="button" class="secondary">アカウント一覧を取得（利用量の可能性あり）</button>
+            <button id="load-accounts" type="button" class="secondary">アカウント一覧を取得</button>
             <button id="select-account" type="button" class="secondary" disabled>アカウントを選択</button>
           </div>
           <p id="account-hint" class="hint"></p>
@@ -96,8 +100,32 @@
         </div>
       </section>
 
+      <section class="card" aria-labelledby="usage-title">
+        <h2 id="usage-title">利用カテゴリごとの許可</h2>
+        <p>New Relicの契約・料金モデルはこの連携から確認できません。CCU/aCCUの計測があることだけで、追加料金が発生するとは限りません。利用量が契約に含まれるか、別料金になるかはNew Relicアカウントの契約条件で決まります。</p>
+        <p class="hint">既定ではすべて停止しています。項目を選んで保存すると、このChatGPTユーザーが接続したアカウントに対して許可します。許可は30日で期限切れになり、いつでも解除できます。書き込み・削除操作の許可にはなりません。</p>
+        <form id="usage-form">
+          <div class="consent-option">
+            <label><input id="consent-core" type="checkbox"><span><strong>通常の読み取りでCore Computeを使う</strong></span></label>
+            <p>NRQL、アカウント一覧、メトリクス、ログ、アラート、Scylla調査などのCoreツール用です。CCUを消費する場合があります。実際の請求は契約モデルによるため、この連携は追加料金の有無を推測しません。</p>
+          </div>
+          <div class="consent-option">
+            <label><input id="consent-advanced" type="checkbox"><span><strong>Advanced ComputeのAI分析を使う</strong></span></label>
+            <p>New RelicのAI分析4種など、aCCUを使うAdvancedツール用です。対応する契約または試用枠が必要です。この選択は利用権や試用後の料金を確認するものではありません。</p>
+          </div>
+          <div class="consent-option">
+            <label><input id="consent-preview" type="checkbox"><span><strong>Previewツールを使う</strong></span></label>
+            <p>Preview指定の読み取り専用ツール用です。CoreまたはAdvancedの許可に加えて個別に選択してください。利用可能範囲や料金は変更される場合がありますが、この連携では確認できません。</p>
+          </div>
+          <div class="actions">
+            <button id="save-usage-consent" type="submit">許可設定を保存</button>
+          </div>
+          <p id="usage-status" class="hint" role="status" aria-live="polite">許可設定を読み込んでいます…</p>
+        </form>
+      </section>
+
       <p class="note"><strong>使い方：</strong>接続とアカウント選択の後は、iPhone版ChatGPTの通常チャットで「ScyllaDBの直近30分を調べて」のように頼めます。アカウントIDやNRQLを毎回入力する必要はありません。</p>
-      <p class="note"><strong>利用量：</strong>New Relic公式MCPの読み取りもCore Computeなどの利用量を消費する可能性があります。アカウント一覧やデータ取得は既定で無効です。Site管理者が契約を確認し、明示的に <code>NEW_RELIC_ENABLE_METERED_READS=true</code> を設定するまで公式データ読み取りを実行しません。</p>
+      <p class="note"><strong>利用量：</strong>Core ComputeとAdvanced Computeは別カテゴリです。通常の読み取りはCoreの許可だけで使えます。New RelicのAI分析にはAdvanced Compute用の許可が別に必要です。これは課金方法や利用権の判定ではありません。</p>
       <footer>ChatGPT Sites MCP · New Relic公式MCPを読み取り専用で利用 · ログやチャットへOAuthトークンを出力しません</footer>
     </main>
     <script>
@@ -112,8 +140,19 @@
       const connectionDetail = document.querySelector("#connection-detail");
       const connectLink = document.querySelector("#connect-link");
       const reconnectLink = document.querySelector("#reconnect-link");
+      const regionSelect = document.querySelector("#region");
       const loadAccountsButton = document.querySelector("#load-accounts");
       const selectAccountButton = document.querySelector("#select-account");
+      const usageForm = document.querySelector("#usage-form");
+      const usageStatus = document.querySelector("#usage-status");
+      const saveUsageConsentButton = document.querySelector("#save-usage-consent");
+      let usageConsentState = null;
+      const requestedRegion = new URL(window.location.href).searchParams.get("connect_region");
+      if (["us", "eu", "jp"].includes(requestedRegion)) {
+        regionSelect.value = requestedRegion;
+        connectLink.href = "/oauth/start?region=" + encodeURIComponent(requestedRegion);
+        reconnectLink.href = connectLink.href;
+      }
 
       async function api(path, options) {
         const response = await fetch(path, Object.assign({ cache: "no-store" }, options || {}));
@@ -168,6 +207,48 @@
         }
       }
 
+      function consentEnabled(capability) {
+        return usageConsentState?.[capability]?.enabled === true;
+      }
+
+      function updateAccountControls() {
+        if (connectedPanel.hidden) return;
+        accountControls.hidden = false;
+        const coreEnabled = consentEnabled("core_compute");
+        loadAccountsButton.disabled = !coreEnabled;
+        if (!coreEnabled) {
+          selectAccountButton.disabled = true;
+          accountHint.textContent = "アカウント一覧や通常の読み取りを使うには、上のCore Compute許可を選んで保存してください。計測と追加請求は同じ意味ではありません。";
+        } else if (stateSelectedAccount) {
+          accountHint.textContent = "保存済みの選択: " + stateSelectedAccount + "。一覧取得はボタンを押したときだけ行います。";
+        } else {
+          accountHint.textContent = "アカウント一覧はボタンを押したときだけ取得します。";
+        }
+        accountHint.classList.remove("error");
+      }
+
+      async function loadUsageConsents() {
+        usageStatus.textContent = "許可設定を読み込んでいます…";
+        saveUsageConsentButton.disabled = true;
+        for (const selector of ["#consent-core", "#consent-advanced", "#consent-preview"]) document.querySelector(selector).disabled = true;
+        try {
+          const data = await api("/api/usage-consent");
+          usageConsentState = data.usageConsents || {};
+          document.querySelector("#consent-core").checked = consentEnabled("core_compute");
+          document.querySelector("#consent-advanced").checked = consentEnabled("advanced_compute");
+          document.querySelector("#consent-preview").checked = consentEnabled("preview");
+          for (const selector of ["#consent-core", "#consent-advanced", "#consent-preview"]) document.querySelector(selector).disabled = false;
+          const expiries = Object.values(usageConsentState).filter(entry => entry?.enabled && Number.isFinite(entry.expiresAt)).map(entry => entry.expiresAt);
+          usageStatus.textContent = expiries.length ? "保存済みの許可は " + new Date(Math.min(...expiries)).toLocaleString("ja-JP") + " まで有効です。" : "Core、Advanced、Previewはいずれも停止中です。";
+          updateAccountControls();
+        } catch (error) {
+          usageStatus.textContent = formatError(error);
+          usageStatus.classList.add("error");
+        } finally {
+          saveUsageConsentButton.disabled = false;
+        }
+      }
+
       async function refresh() {
         setStatus("loading", "接続状態を確認しています…");
         identityHint.hidden = true;
@@ -205,22 +286,15 @@
           setStatus("connected", "New Relic接続情報を保存済み（有効性未確認）");
           const date = state.connectedAt ? new Date(state.connectedAt).toLocaleString("ja-JP") : "";
           const region = ["us", "eu", "jp"].includes(state.region) ? state.region : "us";
+          regionSelect.value = region;
           connectionDetail.textContent = "保存日時: " + (date || "不明") + " · リージョン: " + region.toUpperCase()
             + " · New Relicでのトークン有効性・到達性は未確認"
             + (state.tokenRefreshDue ? " · 次のNew Relic操作でトークン更新が必要になる可能性があります" : "");
           reconnectLink.href = "/oauth/start?region=" + encodeURIComponent(region);
           connectedPanel.hidden = false;
-          if (state.meteredReadsEnabled) {
-            accountControls.hidden = false;
-            accountHint.textContent = state.selectedAccount
-              ? "保存済みの選択: " + (state.selectedAccount.name || state.selectedAccount.id) + "。一覧取得はボタンを押したときだけ行います。"
-              : "アカウント一覧はボタンを押したときだけ取得します。Core Compute等の利用量が発生する可能性があります。";
-          } else {
-            accountHint.textContent = state.selectedAccount
-              ? "保存済みの選択: " + (state.selectedAccount.name || state.selectedAccount.id) + "。新しい一覧取得は既定で停止しています。"
-              : "アカウント一覧は既定で停止しています。Site管理者が利用量を確認し、明示的に有効化するまで取得しません。";
-          }
-          accountHint.classList.remove("error");
+          stateSelectedAccount = state.selectedAccount
+            ? (state.selectedAccount.name || state.selectedAccount.id) : null;
+          updateAccountControls();
         } catch (error) {
           setStatus("error", "状態を取得できません");
           identityHint.textContent = formatError(error);
@@ -228,11 +302,36 @@
         }
       }
 
-      document.querySelector("#region").addEventListener("change", (event) => {
+      regionSelect.addEventListener("change", (event) => {
         connectLink.href = "/oauth/start?region=" + encodeURIComponent(event.target.value);
         reconnectLink.href = connectLink.href;
       });
       document.querySelector("#refresh").addEventListener("click", refresh);
+      usageForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        saveUsageConsentButton.disabled = true;
+        try {
+          const data = await api("/api/usage-consent", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              core_compute: document.querySelector("#consent-core").checked,
+              advanced_compute: document.querySelector("#consent-advanced").checked,
+              preview: document.querySelector("#consent-preview").checked,
+            }),
+          });
+          usageConsentState = data.usageConsents || {};
+          const expiries = Object.values(usageConsentState).filter(entry => entry?.enabled && Number.isFinite(entry.expiresAt)).map(entry => entry.expiresAt);
+          usageStatus.textContent = expiries.length ? "許可を保存しました。有効期限: " + new Date(Math.min(...expiries)).toLocaleString("ja-JP") : "すべての許可を解除しました。";
+          usageStatus.classList.remove("error");
+          updateAccountControls();
+        } catch (error) {
+          usageStatus.textContent = formatError(error);
+          usageStatus.classList.add("error");
+        } finally {
+          saveUsageConsentButton.disabled = false;
+        }
+      });
       loadAccountsButton.addEventListener("click", () => loadAccounts());
       selectAccountButton.addEventListener("click", async () => {
         const button = selectAccountButton;
@@ -266,7 +365,9 @@
         }
       });
 
+      let stateSelectedAccount = null;
       refresh();
+      loadUsageConsents();
     </script>
   </body>
 </html>

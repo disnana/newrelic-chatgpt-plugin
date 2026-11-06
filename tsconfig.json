@@ -15,7 +15,9 @@
     "worker/index.js",
     "worker/newrelic.js",
     "worker/mcp-policy.js",
-    "worker/nrql.js"
+    "worker/usage-consent.js",
+    "worker/nrql.js",
+    "examples/self-host-gateway/gateway.mjs"
   ],
   "exclude": ["dist", "node_modules"]
 }

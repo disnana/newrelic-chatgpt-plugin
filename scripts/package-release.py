@@ -6,7 +6,7 @@ version=sys.argv[1] if len(sys.argv)>1 else 'v'+(root/'VERSION').read_text().str
 if not re.fullmatch(r'v\d+\.\d+\.\d+',version):raise SystemExit('Expected vX.Y.Z')
 subprocess.run([sys.executable,str(root/'scripts/check-distribution.py')],check=True)
 files=[p for p in root.rglob('*') if p.is_file() and not any(x in p.relative_to(root).parts for x in ['.git','dist','outputs','node_modules','__pycache__'])]
-required=['VERSION','README.md','README.en.md','LICENSE','package.json','package-lock.json','tsconfig.json','.openai/hosting.json','worker/index.js','worker/newrelic.js','drizzle/0000_newrelic_mcp.sql','drizzle/0001_refresh_locks.sql','drizzle/0002_oauth_completion_fence.sql','docs/setup.md','docs/oauth.md','docs/troubleshooting.md','docs/v0.4.0-migration.md','docs/official-mcp-inventory.json','docs/security-review.md']
+required=['VERSION','README.md','README.en.md','LICENSE','package.json','package-lock.json','tsconfig.json','.openai/hosting.json','worker/index.js','worker/newrelic.js','worker/mcp-policy.js','worker/usage-consent.js','examples/self-host-gateway/gateway.mjs','examples/self-host-gateway/README.md','scripts/test-self-host-gateway.mjs','drizzle/0000_newrelic_mcp.sql','drizzle/0001_refresh_locks.sql','drizzle/0002_oauth_completion_fence.sql','drizzle/0003_usage_consents.sql','docs/setup.md','docs/oauth.md','docs/troubleshooting.md','docs/v0.4.0-migration.md','docs/official-mcp-inventory.json','docs/security-review.md']
 assert all((root/p).is_file() for p in required)
 out=root/'outputs';out.mkdir(exist_ok=True)
 archive=out/f'NewRelic-ChatGPT-setup-{version}.zip'

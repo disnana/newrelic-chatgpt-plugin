@@ -5,36 +5,53 @@ globalThis.crypto ||= webcrypto;
 const tool={name:'example_read',inputSchema:{type:'object',properties:{accountId:{type:'integer'},query:{type:'string',maxLength:100}},required:['accountId'],additionalProperties:false}};
 const hash=await schemaFingerprint(tool);
 const policy={schemaHash:hash,operation:'read',billing:'core_compute',preview:false,scope:'account',accountFields:['accountId']};
-const env={NEW_RELIC_MCP_POLICIES:JSON.stringify({example_read:policy}),NEW_RELIC_ENABLE_METERED_READS:'true'};
+const env={NEW_RELIC_MCP_POLICIES:JSON.stringify({example_read:policy})};
+const coreConsent={core_compute:true,advanced_compute:false,preview:false};
 assert.equal((await capabilityCatalog([tool],{}))[0].reason,'policy_not_reviewed');
-assert.equal((await capabilityCatalog([tool],env))[0].available,true);
-await authorizeReadTool({tools:[tool]},env,tool.name,{accountId:1},'1',['1']);
+assert.equal((await capabilityCatalog([tool],env))[0].reason,'usage_consent_required');
+assert.equal((await capabilityCatalog([tool],{...env,NEW_RELIC_ENABLE_METERED_READS:'true'}))[0].reason,'usage_consent_required',
+ 'legacy environment switches do not become per-user consent');
+assert.equal((await capabilityCatalog([tool],env,coreConsent))[0].available,true);
+await authorizeReadTool({tools:[tool]},env,tool.name,{accountId:1},'1',['1'],coreConsent);
 for(const args of [{accountId:2},{accountId:'1'},{accountId:1,unknown:true},JSON.parse('{"accountId":1,"__proto__":{}}')]) {
-  await assert.rejects(authorizeReadTool({tools:[tool]},env,tool.name,args,'1',['1']));
+  await assert.rejects(authorizeReadTool({tools:[tool]},env,tool.name,args,'1',['1'],coreConsent));
 }
-await assert.rejects(authorizeReadTool({tools:[tool]},env,tool.name,{accountId:1},'1',['2']));
-await assert.rejects(authorizeReadTool({tools:[tool]},env,'example-read',{accountId:1},'1',['1']));
-await assert.rejects(capabilityCatalog([tool,tool],env));
+await assert.rejects(authorizeReadTool({tools:[tool]},env,tool.name,{accountId:1},'1',['2'],coreConsent));
+await assert.rejects(authorizeReadTool({tools:[tool]},env,'example-read',{accountId:1},'1',['1'],coreConsent));
+await assert.rejects(capabilityCatalog([tool,tool],env,coreConsent));
 const changed={...tool,inputSchema:{...tool.inputSchema,additionalProperties:true}};
-assert.equal((await capabilityCatalog([changed],env))[0].reason,'schema_changed_review_required');
-for(const [field,value,reason] of [['operation','write','operation_approval_not_implemented'],['operation','destructive','operation_approval_not_implemented'],['billing','unknown','billing_unverified'],['preview',true,'preview_opt_in_required']]) {
- const blocked={NEW_RELIC_MCP_POLICIES:JSON.stringify({example_read:{...policy,[field]:value}}),...(field==='preview'?{NEW_RELIC_ENABLE_METERED_READS:'true'}:{})};
- assert.equal((await capabilityCatalog([tool],blocked))[0].reason,reason);
- await assert.rejects(authorizeReadTool({tools:[tool]},blocked,tool.name,{accountId:1},'1',['1']));
+assert.equal((await capabilityCatalog([changed],env,coreConsent))[0].reason,'schema_changed_review_required');
+for(const [field,value,reason] of [['operation','write','operation_approval_not_implemented'],['operation','destructive','operation_approval_not_implemented'],['billing','unknown','billing_unverified'],['preview',true,'preview_consent_required']]) {
+ const blocked={NEW_RELIC_MCP_POLICIES:JSON.stringify({example_read:{...policy,[field]:value}})};
+ assert.equal((await capabilityCatalog([tool],blocked,coreConsent))[0].reason,reason);
+ await assert.rejects(authorizeReadTool({tools:[tool]},blocked,tool.name,{accountId:1},'1',['1'],coreConsent));
+}
+for(const operation of ['write','destructive']) {
+ const everyOptIn={
+  NEW_RELIC_MCP_POLICIES:JSON.stringify({example_read:{...policy,operation}}),
+  NEW_RELIC_ENABLE_WRITE_APPROVALS:'true',
+  NEW_RELIC_ENABLE_DESTRUCTIVE_APPROVALS:'true',
+ };
+ const row=(await capabilityCatalog([tool],everyOptIn))[0];
+ assert.equal(row.available,false,operation+' stays disabled even if unrelated or future opt-in flags are present');
+ assert.equal(row.reason,'operation_approval_not_implemented');
+ await assert.rejects(authorizeReadTool({tools:[tool]},everyOptIn,tool.name,{accountId:1},'1',['1'],coreConsent));
 }
 for(const [blocked,reason] of [
- [{NEW_RELIC_MCP_POLICIES:JSON.stringify({example_read:{...policy,billing:'core_compute'}})},'metered_reads_disabled'],
- [{NEW_RELIC_MCP_POLICIES:JSON.stringify({example_read:{...policy,billing:'advanced_compute'}})},'advanced_compute_opt_in_required'],
+ [{NEW_RELIC_MCP_POLICIES:JSON.stringify({example_read:{...policy,billing:'core_compute'}})},'usage_consent_required'],
+ [{NEW_RELIC_MCP_POLICIES:JSON.stringify({example_read:{...policy,billing:'advanced_compute'}})},'advanced_compute_consent_required'],
 ]) {
  assert.equal((await capabilityCatalog([tool],blocked))[0].reason,reason);
  await assert.rejects(authorizeReadTool({tools:[tool]},blocked,tool.name,{accountId:1},'1',['1']));
 }
 const advancedEnabled={
  NEW_RELIC_MCP_POLICIES:JSON.stringify({example_read:{...policy,billing:'advanced_compute'}}),
- NEW_RELIC_ENABLE_ADVANCED_COMPUTE:'true',
 };
-assert.equal((await capabilityCatalog([tool],advancedEnabled))[0].available,true);
-await authorizeReadTool({tools:[tool]},advancedEnabled,tool.name,{accountId:1},'1',['1']);
+assert.equal((await capabilityCatalog([tool],advancedEnabled))[0].reason,'advanced_compute_consent_required');
+assert.equal((await capabilityCatalog([tool],{...advancedEnabled,NEW_RELIC_ENABLE_ADVANCED_COMPUTE:'true'}))[0].reason,'advanced_compute_consent_required');
+const advancedConsent={core_compute:false,advanced_compute:true,preview:false};
+assert.equal((await capabilityCatalog([tool],advancedEnabled,advancedConsent))[0].available,true);
+await authorizeReadTool({tools:[tool]},advancedEnabled,tool.name,{accountId:1},'1',['1'],advancedConsent);
 assert.throws(()=>readPolicies({NEW_RELIC_MCP_POLICIES:JSON.stringify({example_read:{...policy,billing:'free'}})}));
 for(const [field,value] of [['properties',null],['required',null],['anyOf',null],['oneOf',false],['allOf',null],['items',null]]) {
  assert.throws(()=>validateSchema({}, {type:'object',[field]:value}), `malformed ${field} schema should fail closed`);
