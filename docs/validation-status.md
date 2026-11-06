@@ -22,7 +22,8 @@ The documentation inventory contains 41 tool names, but the authenticated accoun
 ## Remaining deployment and release checks
 
 - A fresh ChatGPT Site installation, real OAuth renewal and real D1 concurrency still need owner-controlled verification after separate deployment approval.
-- A general-purpose self-host authentication gateway is not implemented. The current identity path assumes trusted ChatGPT Sites identity headers; do not expose it as a multi-user public service.
+- An opt-in `signed_proxy` assertion verifier was added and locally tested with synthetic keys/subjects, key rotation, zero-D1/zero-provider rejection, OAuth start/manual completion subject binding, status, MCP requests, and public-origin links behind an internal hostname. It is only a verifier: no login/session provider or gateway is included. Real gateway integration, browser session CSRF, end-to-end New Relic redirect, and real-user isolation are unverified; do not expose it as a multi-user public service until separately implemented and reviewed.
 - Write/destructive approval workflow is not implemented, and those operations remain disabled.
+- An operation approval design is documented, but it is not an implementation or authorization to enable writes.
 - Preview, account entitlements and per-account Core/Advanced Compute pricing were not verified.
 - No production deployment or formal Release is included. `VERSION` remains 0.4.0 for the draft PR; merging a version change to main can trigger the existing Release workflow.

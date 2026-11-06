@@ -46,3 +46,5 @@ python3 scripts/test-migrations.py
 - 各自の個人用Siteとして利用し、第三者に公開する場合はOAuthクライアントの利用条件と運用方針を確認してください。独自ソースはMITです。
 
 詳細は docs/security-review.md、docs/testing.md、docs/v0.4.0-migration.md を参照してください。
+
+このセットアップは所有者限定のChatGPT Sites向けです。独自ホストで複数ユーザー運用をする場合は、[`signed_proxy`認証境界](self-host-auth.md)を読み、実ゲートウェイの実装と個別レビューが済むまで公開しないでください。

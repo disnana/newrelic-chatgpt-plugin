@@ -82,7 +82,138 @@ async function hash(value) {
   return new Uint8Array(await crypto.subtle.digest("SHA-256", encoder.encode(value)));
 }
 
-export async function siteUserId(request) {
+export function authenticationMode(env = {}) {
+  const mode = env?.NEW_RELIC_AUTH_MODE || "sites";
+  return mode === "sites" || mode === "signed_proxy" ? mode : "invalid";
+}
+
+function configuredSelfHostOrigin(env) {
+  const value = env?.NEW_RELIC_AUTH_ALLOWED_ORIGIN;
+  if (typeof value !== "string" || !value || value.length > 512) return null;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.origin !== value || url.username || url.password
+      || url.pathname !== "/" || url.search || url.hash) return null;
+    return value;
+  } catch { return null; }
+}
+
+function secureIssuer(value) {
+  if (typeof value !== "string" || !value || value.length > 256) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && !url.username && !url.password && !url.search && !url.hash;
+  } catch { return false; }
+}
+
+export function isRequestOriginAllowed(request, env = {}, requireOrigin = false) {
+  const mode = authenticationMode(env);
+  if (mode === "signed_proxy") {
+    if (request.headers.get("sec-fetch-site") === "cross-site") return false;
+    const origin = request.headers.get("origin");
+    return origin ? origin === configuredSelfHostOrigin(env) : !requireOrigin;
+  }
+  if (mode !== "sites") return false;
+  try { return request.headers.get("origin") === new URL(request.url).origin; }
+  catch { return false; }
+}
+
+export function publicAppOrigin(request, env = {}) {
+  const mode = authenticationMode(env);
+  if (mode === "signed_proxy") return configuredSelfHostOrigin(env);
+  if (mode !== "sites") return null;
+  try { return new URL(request.url).origin; }
+  catch { return null; }
+}
+
+function plainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    && [Object.prototype, null].includes(Object.getPrototypeOf(value));
+}
+
+function decodeJwtJson(segment, maxBytes) {
+  if (typeof segment !== "string" || !segment || segment.length > maxBytes * 2
+    || !/^[A-Za-z0-9_-]+$/.test(segment)) return null;
+  try {
+    const bytes = base64UrlToBytes(segment);
+    if (bytes.byteLength > maxBytes) return null;
+    const value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+    return plainObject(value) ? value : null;
+  } catch { return null; }
+}
+
+function selfHostAllowedSubjects(env) {
+  const configured = env?.NEW_RELIC_AUTH_ALLOWED_SUBJECTS;
+  if (typeof configured !== "string" || configured.length > 32768) return null;
+  try {
+    const values = JSON.parse(configured);
+    if (!Array.isArray(values) || values.length < 1 || values.length > 100
+      || values.some(value => typeof value !== "string" || !value || value.length > 256 || /[\u0000-\u001f\u007f]/.test(value))) return null;
+    return new Set(values);
+  } catch { return null; }
+}
+
+async function signedProxyPrincipal(request, env) {
+  const issuer = env?.NEW_RELIC_AUTH_ISSUER;
+  const audience = env?.NEW_RELIC_AUTH_AUDIENCE;
+  const encodedKey = env?.NEW_RELIC_AUTH_JWT_PUBLIC_KEY;
+  const allowedSubjects = selfHostAllowedSubjects(env);
+  if (!secureIssuer(issuer)
+    || typeof audience !== "string" || !audience || audience.length > 256
+    || !configuredSelfHostOrigin(env)
+    || typeof encodedKey !== "string" || encodedKey.length > 8192 || !/^[A-Za-z0-9_-]+$/.test(encodedKey)
+    || !allowedSubjects) return null;
+
+  const authorization = request.headers.get("authorization") || "";
+  if (authorization.length > 8192) return null;
+  const match = /^Bearer ([A-Za-z0-9._-]+)$/.exec(authorization);
+  if (!match || match[1].length > 4096) return null;
+  const parts = match[1].split(".");
+  if (parts.length !== 3) return null;
+  const header = decodeJwtJson(parts[0], 1024);
+  const claims = decodeJwtJson(parts[1], 4096);
+  if (!header || !claims || header.alg !== "RS256"
+    || (header.typ !== undefined && header.typ !== "JWT")
+    || ["jku", "jwk", "x5u", "crit", "b64"].some(name => Object.hasOwn(header, name))) return null;
+  const expectedKid = env?.NEW_RELIC_AUTH_JWT_KID;
+  if (expectedKid && header.kid !== expectedKid) return null;
+  if (!expectedKid && header.kid !== undefined && (typeof header.kid !== "string" || header.kid.length > 128)) return null;
+
+  const subject = claims.sub;
+  if (claims.iss !== issuer || !(claims.aud === audience || Array.isArray(claims.aud) && claims.aud.length <= 8 && claims.aud.includes(audience))
+    || typeof subject !== "string" || !allowedSubjects.has(subject)) return null;
+  if ([subject, claims.iss, issuer, audience].some(value => /[\u0000-\u001f\u007f]/.test(value))) return null;
+  const now = Math.floor(Date.now() / 1000);
+  const { exp, iat, nbf } = claims;
+  if (!Number.isSafeInteger(exp) || !Number.isSafeInteger(iat) || exp <= now - 30 || iat > now + 30
+    || iat < now - 900 || exp <= iat || exp - iat > 900
+    || nbf !== undefined && (!Number.isSafeInteger(nbf) || nbf > now + 30 || nbf > exp)) return null;
+  if (!/^[A-Za-z0-9_-]+$/.test(parts[2]) || parts[2].length > 1024) return null;
+
+  let publicKeyBytes;
+  let signature;
+  try {
+    publicKeyBytes = base64UrlToBytes(encodedKey);
+    signature = base64UrlToBytes(parts[2]);
+    if (publicKeyBytes.byteLength > 4096 || signature.byteLength > 512) return null;
+    const key = await crypto.subtle.importKey("spki", publicKeyBytes,
+      { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]);
+    const rsaAlgorithm = /** @type {RsaHashedKeyAlgorithm} */ (key.algorithm);
+    if (rsaAlgorithm.modulusLength < 2048 || rsaAlgorithm.modulusLength > 4096) return null;
+    const verified = await crypto.subtle.verify({ name: "RSASSA-PKCS1-v1_5" }, key, signature, encoder.encode(parts[0] + "." + parts[1]));
+    if (!verified) return null;
+  } catch { return null; }
+  return { issuer, audience, subject };
+}
+
+export async function siteUserId(request, env = {}) {
+  const mode = authenticationMode(env);
+  if (mode === "signed_proxy") {
+    const principal = await signedProxyPrincipal(request, env);
+    if (!principal) return null;
+    return bytesToBase64Url(await hash("signed_proxy\0" + principal.issuer + "\0" + principal.audience + "\0" + principal.subject));
+  }
+  if (mode !== "sites") return null;
   const identity = request.headers.get("oai-authenticated-user-id");
   if (!identity || identity.length > 512) return null;
   return bytesToBase64Url(await hash(identity));

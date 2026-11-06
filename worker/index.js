@@ -16,6 +16,9 @@ import {
   getConnectionStatus,
   getSelectedAccount,
   saveSelectedAccount,
+  authenticationMode,
+  isRequestOriginAllowed,
+  publicAppOrigin,
   siteUserId,
   withNewRelicSession,
 } from "./newrelic.js";
@@ -185,8 +188,9 @@ function jsonResult(id, result) {
   return jsonResponse(payload);
 }
 
-function jsonError(id, code, message) {
-  return jsonResponse({ jsonrpc: "2.0", id, error: { code, message } });
+function jsonError(id, code, message, status = 200) {
+  return jsonResponse({ jsonrpc: "2.0", id, error: { code, message } }, status,
+    status === 401 ? { "www-authenticate": "Bearer" } : {});
 }
 
 function toolError(message) {
@@ -406,11 +410,13 @@ async function handleTool(name, args, request, env, userId) {
   }
   if (name === "connect_new_relic") {
     const region = ["us", "eu", "jp"].includes(args.region) ? args.region : "us";
-    const url = new URL("/oauth/start", new URL(request.url).origin);
+    const publicOrigin = publicAppOrigin(request, env);
+    if (!publicOrigin) return toolError("Public Site origin is not configured.");
+    const url = new URL("/oauth/start", publicOrigin);
     url.searchParams.set("region", region);
     return toolSuccess({
       connected: false,
-      authorizationUrl: url.toString(),
+      connectUrl: url.toString(),
       message: "New Relic公式OAuthを開始するには次のリンクを開いてください: " + url.toString(),
       region,
     });
@@ -421,7 +427,9 @@ async function handleTool(name, args, request, env, userId) {
   }
   if (name === "disconnect_new_relic") {
     needIdentity(userId);
-    return toolSuccess({ actionRequired: "owner_confirmation", connectionPage: new URL("/", request.url).toString(), message: "接続解除は接続ページのボタンから本人が確認してください。モデルからは削除しません。" });
+    const publicOrigin = publicAppOrigin(request, env);
+    if (!publicOrigin) return toolError("Public Site origin is not configured.");
+    return toolSuccess({ actionRequired: "owner_confirmation", connectionPage: new URL("/", publicOrigin).toString(), message: "接続解除は接続ページのボタンから本人が確認してください。モデルからは削除しません。" });
   }
 
   needIdentity(userId);
@@ -621,6 +629,19 @@ async function handleMcp(request, env) {
     || typeof id === "number" && !Number.isFinite(id)) {
     return jsonError(null, -32600, "Invalid request id");
   }
+  const authMode = authenticationMode(env);
+  if (authMode === "invalid") {
+    if (!hasId) return new Response(null, { status: 503, headers: { "cache-control": "no-store" } });
+    return jsonError(id, -32603, "Authentication mode is not configured", 503);
+  }
+  if (authMode === "signed_proxy" && !isRequestOriginAllowed(request, env)) {
+    return jsonError(id, -32003, "Origin is not allowed", 403);
+  }
+  const userId = await siteUserId(request, env);
+  if (authMode === "signed_proxy" && !userId) {
+    if (!hasId) return new Response(null, { status: 401, headers: { ...JSON_HEADERS, "www-authenticate": "Bearer" } });
+    return jsonError(id, -32001, "Authentication required", 401);
+  }
   if (!hasId) return new Response(null, { status: 202, headers: { "cache-control": "no-store" } });
 
   switch (message.method) {
@@ -658,7 +679,6 @@ async function handleMcp(request, env) {
         const definition = TOOLS.find(tool => tool.name === params.name);
         if (!definition) return jsonError(id, -32602, "Unknown tool");
         validateSchema(args, definition.inputSchema);
-        const userId = await siteUserId(request);
         const result = await handleTool(params.name, args, request, env, userId);
         if (!result) return jsonError(id, -32602, "Unknown tool");
         return jsonResult(id, result);
@@ -711,7 +731,15 @@ function requireUser(userId) {
 }
 
 async function handleApi(request, env, pathname) {
-  const userId = await siteUserId(request);
+  const authMode = authenticationMode(env);
+  if (authMode === "invalid") return jsonResponse({ error: "Authentication mode is not configured." }, 503);
+  const userId = await siteUserId(request, env);
+  if (authMode === "signed_proxy" && !userId) {
+    return jsonResponse({ error: "Authentication required." }, 401, { "www-authenticate": "Bearer" });
+  }
+  if (authMode === "signed_proxy" && !isRequestOriginAllowed(request, env)) {
+    return jsonResponse({ error: "Origin is not allowed." }, 403);
+  }
   if (pathname === "/api/status" && request.method === "GET") {
     if (userId) await consumeRateLimit(env, userId, 20);
     const status = await getConnectionStatus(env, userId);
@@ -738,8 +766,7 @@ async function handleApi(request, env, pathname) {
   }
   if (pathname === "/api/oauth/manual-complete" && request.method === "POST") {
     requireUser(userId);
-    const requestUrl = new URL(request.url);
-    if (request.headers.get("origin") !== requestUrl.origin) {
+    if (!isRequestOriginAllowed(request, env, true)) {
       return jsonResponse({ error: "Siteの認証完了ページから送信してください。" }, 403);
     }
     if (!(request.headers.get("content-type") || "").toLowerCase().startsWith("application/json")) {
@@ -752,7 +779,7 @@ async function handleApi(request, env, pathname) {
   }
   if (pathname === "/api/select-account" && request.method === "POST") {
     requireUser(userId);
-    if (request.headers.get("origin") !== new URL(request.url).origin) return jsonResponse({ error: "Siteから操作してください。" }, 403);
+    if (!isRequestOriginAllowed(request, env, true)) return jsonResponse({ error: "Siteから操作してください。" }, 403);
     if (!(request.headers.get("content-type") || "").toLowerCase().startsWith("application/json")) return jsonResponse({ error: "JSONが必要です。" }, 415);
     const args = await parseSmallJson(request);
     const accountId = String(args.accountId || "");
@@ -766,7 +793,7 @@ async function handleApi(request, env, pathname) {
   }
   if (pathname === "/api/disconnect" && request.method === "POST") {
     requireUser(userId);
-    if (request.headers.get("origin") !== new URL(request.url).origin) return jsonResponse({ error: "Siteから操作してください。" }, 403);
+    if (!isRequestOriginAllowed(request, env, true)) return jsonResponse({ error: "Siteから操作してください。" }, 403);
     return jsonResponse(await disconnectNewRelic(env, userId));
   }
   return jsonResponse({ error: "Not found" }, 404);
@@ -824,7 +851,11 @@ export default {
     }
     if (pathname === "/oauth/start" && request.method === "GET") {
       try {
-        const userId = await siteUserId(request);
+        const mode = authenticationMode(env);
+        if (mode === "invalid") return new Response("Authentication mode is not configured.", { status: 503, headers: { "cache-control": "no-store" } });
+        if (mode === "signed_proxy" && !isRequestOriginAllowed(request, env)) return new Response("Origin is not allowed.", { status: 403, headers: { "cache-control": "no-store" } });
+        const userId = await siteUserId(request, env);
+        if (mode === "signed_proxy" && !userId) return new Response("Authentication required.", { status: 401, headers: { "cache-control": "no-store", "www-authenticate": "Bearer" } });
         if (userId) await consumeRateLimit(env, userId, 5, "oauth");
         const region = new URL(request.url).searchParams.get("region");
         return await beginNewRelicAuthorization(request, env, userId, region);
@@ -834,7 +865,10 @@ export default {
     }
     if (pathname === "/oauth/callback" && request.method === "GET") {
       try {
-        const userId = await siteUserId(request);
+        const mode = authenticationMode(env);
+        if (mode === "invalid") return new Response("Authentication mode is not configured.", { status: 503, headers: { "cache-control": "no-store" } });
+        const userId = await siteUserId(request, env);
+        if (mode === "signed_proxy" && !userId) return new Response("Authentication required.", { status: 401, headers: { "cache-control": "no-store", "www-authenticate": "Bearer" } });
         if (userId) await consumeRateLimit(env, userId, 5, "oauth");
         return await completeNewRelicAuthorization(request, env, userId);
       } catch (error) {

@@ -19,8 +19,10 @@ class MemoryD1 {
   preferences = new Map();
   rates = new Map();
   locks = new Map();
+  operations = 0;
 
   prepare(query) {
+    this.operations += 1;
     const normalized = query.replace(/\s+/g, " ").trim().toUpperCase();
     const database = this;
     return {
@@ -205,6 +207,235 @@ const oversizedId = await call("tools/call", { name: "ping", arguments: {} }, {}
 assert.equal(oversizedId.payload.error.code, -32600);
 assert.equal(oversizedId.payload.id, null);
 assert.ok(new TextEncoder().encode(oversizedId.raw).byteLength <= 10000, "oversized request IDs must not defeat the MCP response budget");
+
+// Signed-proxy self-host auth is opt-in and uses a pinned public key. The Site
+// identity header must never act as a fallback in this mode.
+const gatewayKeys = await webcrypto.subtle.generateKey({
+  name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: Uint8Array.of(1, 0, 1), hash: "SHA-256",
+}, true, ["sign", "verify"]);
+const gatewayPublicKey = Buffer.from(await webcrypto.subtle.exportKey("spki", gatewayKeys.publicKey)).toString("base64url");
+const signedProxyEnv = {
+  NEW_RELIC_AUTH_MODE: "signed_proxy",
+  NEW_RELIC_AUTH_JWT_PUBLIC_KEY: gatewayPublicKey,
+  NEW_RELIC_AUTH_JWT_KID: "fixture-key",
+  NEW_RELIC_AUTH_ISSUER: "https://auth.example.test/",
+  NEW_RELIC_AUTH_AUDIENCE: "newrelic-chatgpt-mcp",
+  NEW_RELIC_AUTH_ALLOWED_ORIGIN: "https://example.test",
+  NEW_RELIC_AUTH_ALLOWED_SUBJECTS: JSON.stringify(["owner-1", "member-2"]),
+};
+const encodeJwtPart = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
+async function makeGatewayJwt(claims, header = {}, signingKeys = gatewayKeys) {
+  const protectedHeader = { alg: "RS256", typ: "JWT", kid: "fixture-key", ...header };
+  const signingInput = encodeJwtPart(protectedHeader) + "." + encodeJwtPart(claims);
+  const signature = await webcrypto.subtle.sign("RSASSA-PKCS1-v1_5", signingKeys.privateKey, new TextEncoder().encode(signingInput));
+  return signingInput + "." + Buffer.from(signature).toString("base64url");
+}
+const issuedAt = Math.floor(Date.now() / 1000);
+const ownerClaims = {
+  iss: signedProxyEnv.NEW_RELIC_AUTH_ISSUER,
+  aud: signedProxyEnv.NEW_RELIC_AUTH_AUDIENCE,
+  sub: "owner-1",
+  iat: issuedAt,
+  exp: issuedAt + 300,
+};
+const ownerJwt = await makeGatewayJwt(ownerClaims);
+const signedRequest = new Request("https://example.test/mcp", {
+  headers: { authorization: "Bearer " + ownerJwt, "oai-authenticated-user-id": "forged-sites-user" },
+});
+const ownerUserId = await siteUserId(signedRequest, signedProxyEnv);
+assert.ok(ownerUserId);
+assert.equal(await siteUserId(new Request("https://example.test/", {
+  headers: { "oai-authenticated-user-id": "forged-sites-user" },
+}), signedProxyEnv), null, "a forged Sites identity header is ignored by signed-proxy mode");
+const sameOwnerJwt = await makeGatewayJwt({ ...ownerClaims, iat: issuedAt + 1, exp: issuedAt + 301 });
+assert.equal(await siteUserId(new Request("https://example.test/", {
+  headers: { authorization: "Bearer " + sameOwnerJwt },
+}), signedProxyEnv), ownerUserId, "principal storage identity is stable across short-lived assertions");
+const memberJwt = await makeGatewayJwt({ ...ownerClaims, sub: "member-2" });
+const memberUserId = await siteUserId(new Request("https://example.test/", {
+  headers: { authorization: "Bearer " + memberJwt },
+}), signedProxyEnv);
+assert.notEqual(memberUserId, ownerUserId, "signed-proxy subjects map to separate storage identities");
+const rotatedGatewayKeys = await webcrypto.subtle.generateKey({
+  name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: Uint8Array.of(1, 0, 1), hash: "SHA-256",
+}, true, ["sign", "verify"]);
+const rotatedGatewayPublicKey = Buffer.from(await webcrypto.subtle.exportKey("spki", rotatedGatewayKeys.publicKey)).toString("base64url");
+const rotatedEnv = { ...signedProxyEnv, NEW_RELIC_AUTH_JWT_PUBLIC_KEY: rotatedGatewayPublicKey, NEW_RELIC_AUTH_JWT_KID: "rotated-key" };
+const rotatedOwnerJwt = await makeGatewayJwt(ownerClaims, { kid: "rotated-key" }, rotatedGatewayKeys);
+assert.equal(await siteUserId(new Request("https://example.test/", {
+  headers: { authorization: "Bearer " + rotatedOwnerJwt },
+}), rotatedEnv), ownerUserId, "key rotation preserves a subject's storage identity");
+const [headerPart, claimsPart, signaturePart] = ownerJwt.split(".");
+const tamperedSignature = (signaturePart[0] === "A" ? "B" : "A") + signaturePart.slice(1);
+const invalidJwtRequests = [
+  "Bearer invalid",
+  "Bearer " + headerPart + "." + claimsPart + "." + tamperedSignature,
+  "Bearer " + await makeGatewayJwt({ ...ownerClaims, iss: "https://wrong.example.test/" }),
+  "Bearer " + await makeGatewayJwt({ ...ownerClaims, aud: "wrong-audience" }),
+  "Bearer " + await makeGatewayJwt({ ...ownerClaims, exp: issuedAt - 60 }),
+  "Bearer " + await makeGatewayJwt({ ...ownerClaims, iat: issuedAt + 600 }),
+  "Bearer " + await makeGatewayJwt({ ...ownerClaims, exp: issuedAt + 901 }),
+  "Bearer " + await makeGatewayJwt({ ...ownerClaims, nbf: issuedAt + 60 }),
+  "Bearer " + await makeGatewayJwt({ ...ownerClaims, nbf: issuedAt + 301 }),
+  "Bearer " + await makeGatewayJwt({ ...ownerClaims, sub: "not-allowed" }),
+  "Bearer " + await makeGatewayJwt(ownerClaims, { alg: "HS256" }),
+  "Bearer " + await makeGatewayJwt(ownerClaims, { jku: "https://attacker.example/keys" }),
+  "Bearer " + await makeGatewayJwt(ownerClaims, { kid: "other-key" }),
+];
+for (const authorization of invalidJwtRequests) {
+  assert.equal(await siteUserId(new Request("https://example.test/", {
+    headers: { authorization, "oai-authenticated-user-id": "forged-sites-user" },
+  }), signedProxyEnv), null, "invalid signed assertions fail closed without Sites-header fallback");
+}
+assert.equal(await siteUserId(new Request("https://example.test/", {
+  headers: { authorization: "Bearer " + ownerJwt },
+}), { ...signedProxyEnv, NEW_RELIC_AUTH_JWT_PUBLIC_KEY: "bad-key" }), null, "malformed auth config fails closed");
+assert.equal(await siteUserId(new Request("https://example.test/", {
+  headers: { authorization: "Bearer " + ownerJwt },
+}), { ...signedProxyEnv, NEW_RELIC_AUTH_ISSUER: "http://auth.example.test/" }), null, "insecure issuer configuration fails closed");
+assert.equal(await siteUserId(new Request("https://example.test/", {
+  headers: { authorization: "Bearer " + ownerJwt },
+}), { ...signedProxyEnv, NEW_RELIC_AUTH_ALLOWED_ORIGIN: "http://example.test" }), null, "insecure Origin configuration fails closed");
+
+const signedPingRequest = new Request("https://example.test/mcp", {
+  method: "POST",
+  headers: { "content-type": "application/json", authorization: "Bearer " + ownerJwt, origin: "https://example.test" },
+  body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "ping", arguments: {} } }),
+});
+const signedPing = await worker.fetch(signedPingRequest, signedProxyEnv);
+assert.equal(signedPing.status, 200);
+assert.equal((await signedPing.json()).result.content[0].text, "pong");
+const signedCrossOrigin = await worker.fetch(new Request("https://example.test/mcp", {
+  method: "POST",
+  headers: { "content-type": "application/json", authorization: "Bearer " + ownerJwt, origin: "https://attacker.example" },
+  body: JSON.stringify({ jsonrpc: "2.0", id: 5, method: "tools/list" }),
+}), signedProxyEnv);
+assert.equal(signedCrossOrigin.status, 403, "signed-proxy mode rejects browser MCP requests from other origins");
+const signedCrossSiteWithoutOrigin = await worker.fetch(new Request("https://example.test/mcp", {
+  method: "POST",
+  headers: { "content-type": "application/json", authorization: "Bearer " + ownerJwt, "sec-fetch-site": "cross-site" },
+  body: JSON.stringify({ jsonrpc: "2.0", id: 6, method: "tools/list" }),
+}), signedProxyEnv);
+assert.equal(signedCrossSiteWithoutOrigin.status, 403, "signed-proxy mode checks fetch metadata even without an Origin header");
+const unauthenticatedSignedMcp = await worker.fetch(new Request("https://example.test/mcp", {
+  method: "POST", headers: { "content-type": "application/json", "oai-authenticated-user-id": "forged-sites-user" },
+  body: JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/list" }),
+}), signedProxyEnv);
+assert.equal(unauthenticatedSignedMcp.status, 401);
+assert.equal((await unauthenticatedSignedMcp.text()).includes(ownerJwt), false);
+const invalidBearerMarker = "synthetic-invalid-private-marker";
+const invalidBearerMcp = await worker.fetch(new Request("https://example.test/mcp", {
+  method: "POST", headers: { "content-type": "application/json", authorization: "Bearer " + invalidBearerMarker },
+  body: JSON.stringify({ jsonrpc: "2.0", id: 10, method: "tools/list" }),
+}), signedProxyEnv);
+assert.equal(invalidBearerMcp.status, 401);
+assert.equal((await invalidBearerMcp.text()).includes(invalidBearerMarker), false, "authentication errors never echo assertion text");
+const invalidAuthMode = await worker.fetch(new Request("https://example.test/mcp", {
+  method: "POST", headers: { "content-type": "application/json" },
+  body: JSON.stringify({ jsonrpc: "2.0", id: 4, method: "tools/list" }),
+}), { NEW_RELIC_AUTH_MODE: "unknown" });
+assert.equal(invalidAuthMode.status, 503);
+const signedDeniedEnv = { ...signedProxyEnv, DB: new MemoryD1() };
+const noAuthUpstreamFetch = globalThis.fetch;
+let unauthenticatedUpstreamCalls = 0;
+globalThis.fetch = async () => { unauthenticatedUpstreamCalls += 1; throw new Error("unexpected unauthenticated upstream request"); };
+try {
+  const unauthenticatedRoutes = [
+    ["/api/status", { method: "GET" }],
+    ["/api/select-account", { method: "POST" }],
+    ["/oauth/start", { method: "GET" }],
+    ["/oauth/callback?state=untrusted&code=untrusted", { method: "GET" }],
+    ["/mcp", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 9, method: "tools/list" }) }],
+  ];
+  for (const [path, init] of unauthenticatedRoutes) {
+    const headers = new Headers(init.headers || {});
+    headers.set("authorization", "Bearer invalid");
+    headers.set("oai-authenticated-user-id", "forged-sites-user");
+    const response = await worker.fetch(new Request("https://example.test" + path, { ...init, headers }), signedDeniedEnv);
+    assert.equal(response.status, 401, "invalid signed assertions deny every protected route");
+  }
+} finally {
+  globalThis.fetch = noAuthUpstreamFetch;
+}
+assert.equal(signedDeniedEnv.DB.operations, 0, "invalid assertions cause zero D1 operations");
+assert.equal(unauthenticatedUpstreamCalls, 0, "invalid assertions cause zero provider requests");
+const signedRuntimeEnv = {
+  ...signedProxyEnv,
+  NEW_RELIC_TOKEN_ENCRYPTION_KEY: Buffer.from(webcrypto.getRandomValues(new Uint8Array(32))).toString("base64url"),
+  DB: new MemoryD1(),
+};
+const signedInternalConnect = await worker.fetch(new Request("https://worker.internal/mcp", {
+  method: "POST",
+  headers: { "content-type": "application/json", authorization: "Bearer " + ownerJwt, origin: "https://example.test" },
+  body: JSON.stringify({ jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "connect_new_relic", arguments: { region: "jp" } } }),
+}), signedRuntimeEnv);
+const signedInternalConnectPayload = await signedInternalConnect.json();
+assert.equal(new URL(signedInternalConnectPayload.result.structuredContent.connectUrl).origin, "https://example.test",
+  "self-host authorization links use the configured external origin behind a reverse proxy");
+const signedInternalDisconnect = await worker.fetch(new Request("https://worker.internal/mcp", {
+  method: "POST",
+  headers: { "content-type": "application/json", authorization: "Bearer " + ownerJwt, origin: "https://example.test" },
+  body: JSON.stringify({ jsonrpc: "2.0", id: 8, method: "tools/call", params: { name: "disconnect_new_relic", arguments: {} } }),
+}), signedRuntimeEnv);
+const signedInternalDisconnectPayload = await signedInternalDisconnect.json();
+assert.equal(new URL(signedInternalDisconnectPayload.result.structuredContent.connectionPage).origin, "https://example.test",
+  "self-host account links use the configured external origin behind a reverse proxy");
+const signedMissingStatus = await worker.fetch(new Request("https://example.test/api/status"), signedRuntimeEnv);
+assert.equal(signedMissingStatus.status, 401, "self-host API status requires the gateway assertion");
+const signedMissingOAuth = await worker.fetch(new Request("https://example.test/oauth/start?region=jp"), signedRuntimeEnv);
+assert.equal(signedMissingOAuth.status, 401, "self-host OAuth start requires the gateway assertion");
+const signedCrossOriginOAuth = await worker.fetch(new Request("https://example.test/oauth/start?region=jp", {
+  headers: { authorization: "Bearer " + ownerJwt, origin: "https://attacker.example", "sec-fetch-site": "cross-site" },
+}), signedRuntimeEnv);
+assert.equal(signedCrossOriginOAuth.status, 403, "cross-site OAuth start is rejected in signed-proxy mode");
+const signedOwnerStart = await worker.fetch(new Request("https://example.test/oauth/start?region=jp", {
+  headers: { authorization: "Bearer " + ownerJwt },
+}), signedRuntimeEnv);
+assert.equal(signedOwnerStart.status, 302);
+assert.equal([...signedRuntimeEnv.DB.states.values()][0].user_id, ownerUserId, "OAuth state is bound to the signed owner principal");
+const signedMemberStart = await worker.fetch(new Request("https://example.test/oauth/start?region=jp", {
+  headers: { authorization: "Bearer " + memberJwt },
+}), signedRuntimeEnv);
+assert.equal(signedMemberStart.status, 302);
+assert.deepEqual(new Set([...signedRuntimeEnv.DB.states.values()].map(row => row.user_id)), new Set([ownerUserId, memberUserId]));
+const signedOAuthLocation = new URL(signedOwnerStart.headers.get("location"));
+const signedCallbackUrl = signedOAuthLocation.searchParams.get("redirect_uri") + "?code=synthetic-signed-code&state="
+  + encodeURIComponent(signedOAuthLocation.searchParams.get("state"));
+const signedOriginalFetch = globalThis.fetch;
+globalThis.fetch = async (url, options) => {
+  assert.equal(String(url), "https://oauth2.service.newrelic.com/oauth2/token");
+  assert.equal(new URLSearchParams(options.body).get("code"), "synthetic-signed-code");
+  return Response.json({ access_token: "synthetic-access-token", refresh_token: "synthetic-refresh-token", expires_in: 300 });
+};
+try {
+  const wrongSignedPrincipal = await worker.fetch(new Request("https://example.test/api/oauth/manual-complete", {
+    method: "POST",
+    headers: { authorization: "Bearer " + memberJwt, origin: "https://example.test", "content-type": "application/json" },
+    body: JSON.stringify({ callbackUrl: signedCallbackUrl }),
+  }), signedRuntimeEnv);
+  assert.equal(wrongSignedPrincipal.status, 401, "a second signed subject cannot consume another user's OAuth state");
+  const signedOwnerCompletion = await worker.fetch(new Request("https://example.test/api/oauth/manual-complete", {
+    method: "POST",
+    headers: { authorization: "Bearer " + ownerJwt, origin: "https://example.test", "content-type": "application/json" },
+    body: JSON.stringify({ callbackUrl: signedCallbackUrl }),
+  }), signedRuntimeEnv);
+  assert.equal(signedOwnerCompletion.status, 200);
+  assert.deepEqual(await signedOwnerCompletion.json(), { connected: true, region: "jp" });
+  assert.ok(signedRuntimeEnv.DB.connections.has(ownerUserId), "OAuth completion stores credentials only for the initiating subject");
+  assert.equal(signedRuntimeEnv.DB.connections.has(memberUserId), false);
+} finally {
+  globalThis.fetch = signedOriginalFetch;
+}
+const signedOwnerStatus = await worker.fetch(new Request("https://example.test/api/status", {
+  headers: { authorization: "Bearer " + ownerJwt },
+}), signedRuntimeEnv);
+assert.equal(signedOwnerStatus.status, 200);
+assert.equal((await signedOwnerStatus.json()).connected, true);
+const signedMutationWithoutOrigin = await worker.fetch(new Request("https://example.test/api/disconnect", {
+  method: "POST", headers: { authorization: "Bearer " + ownerJwt },
+}), signedRuntimeEnv);
+assert.equal(signedMutationWithoutOrigin.status, 403, "browser-facing signed-proxy mutations require the configured Origin");
+
 const unknown = await call("tools/call", { name: "unknown_tool", arguments: {} });
 assert.equal(unknown.payload.error.code, -32602);
 
@@ -368,7 +599,20 @@ try {
   const replayText = await replay.text();
   assert.equal(replayText.includes("one-time-test-code"), false);
 
-  const readTool = { name: "fixture_read", inputSchema: { type: "object", properties: {}, required: [], additionalProperties: false } };
+  const readTool = {
+    name: "fixture_read",
+    inputSchema: { type: "object", properties: {}, required: [], additionalProperties: false },
+    outputSchema: {
+      type: "object",
+      properties: {
+        access_token_value: { type: "string" },
+        refresh_token_backup: { type: "string" },
+        authorization_token: { type: "string" },
+      },
+      required: ["access_token_value", "refresh_token_backup", "authorization_token"],
+      additionalProperties: false,
+    },
+  };
   let upstreamToolCalls = 0;
   globalThis.fetch = async (_url, options) => {
     const request = JSON.parse(options.body);
@@ -398,14 +642,45 @@ try {
     if (request.method === "tools/list") return Response.json({ jsonrpc: "2.0", id: request.id, result: { tools: [readTool] } });
     if (request.method === "tools/call") {
       upstreamToolCalls += 1;
-      return Response.json({ jsonrpc: "2.0", id: request.id, result: { content: [{ type: "text", text: "測".repeat(10000) }] } });
+      return Response.json({ jsonrpc: "2.0", id: request.id, result: {
+        content: [{ type: "text", text: "fixture" }],
+        structuredContent: {
+          access_token_value: "opaque-access-fixture",
+          refresh_token_backup: "opaque-refresh-fixture",
+          authorization_token: "opaque-auth-fixture",
+        },
+      } });
+    }
+    throw new Error("Unexpected MCP method " + request.method);
+  };
+  const credentialShapedResult = await call("tools/call", { name: "read_official_mcp", arguments: { toolName: "fixture_read", arguments: {} } }, reviewedEnv, identity);
+  const safeStructuredResult = credentialShapedResult.payload.result.structuredContent.result.structuredContent;
+  assert.equal(safeStructuredResult.access_token_value, "[REDACTED]");
+  assert.equal(safeStructuredResult.refresh_token_backup, "[REDACTED]");
+  assert.equal(safeStructuredResult.authorization_token, "[REDACTED]");
+  assert.equal(upstreamToolCalls, 1);
+  globalThis.fetch = async (_url, options) => {
+    const request = JSON.parse(options.body);
+    if (request.method === "notifications/initialized") return new Response(null, { status: 202 });
+    if (request.method === "initialize") return Response.json({ jsonrpc: "2.0", id: request.id, result: {} });
+    if (request.method === "tools/list") return Response.json({ jsonrpc: "2.0", id: request.id, result: { tools: [readTool] } });
+    if (request.method === "tools/call") {
+      upstreamToolCalls += 1;
+      return Response.json({ jsonrpc: "2.0", id: request.id, result: {
+        content: [{ type: "text", text: "測".repeat(10000) }],
+        structuredContent: {
+          access_token_value: "opaque-access-fixture",
+          refresh_token_backup: "opaque-refresh-fixture",
+          authorization_token: "opaque-auth-fixture",
+        },
+      } });
     }
     throw new Error("Unexpected MCP method " + request.method);
   };
   const bounded = await call("tools/call", { name: "read_official_mcp", arguments: { toolName: "fixture_read", arguments: {} } }, reviewedEnv, identity);
   assert.equal(bounded.payload.result.isError, undefined);
   assert.ok(new TextEncoder().encode(bounded.raw).byteLength <= 10000, "combined MCP result must fit the byte budget");
-  assert.equal(upstreamToolCalls, 1);
+  assert.equal(upstreamToolCalls, 2);
 
   const pendingStart = await beginNewRelicAuthorization(
     new Request("https://example.test/oauth/start?region=jp"), oauthEnv, userId, "jp",
