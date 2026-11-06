@@ -14,14 +14,14 @@ Disnanaによる**非公式**のNew Relic連携です。各利用者が自分の
 - ScyllaDBのメトリクス・属性探索、期間比較
 - OAuth PKCE、暗号化保存、同時refresh制御、取得量の制限
 
-「New Relicに接続できている？」「直近30分のログを調べて」「rack2とrack3のReactor stallを比較して」のように依頼します。メトリクスとrack属性は取得結果から確認し、推測で名前を固定しません。
+New Relic公式MCPの読み取り専用操作も Core Compute などの利用量を消費する可能性があるため、アカウント一覧・NRQL・メトリクス・ログ・アラート取得は既定で無効です。Site管理者が契約を確認して `NEW_RELIC_ENABLE_METERED_READS=true` を明示した場合だけ、「直近30分のログを調べて」のように利用できます。読み取り専用は無料を意味しません。メトリクス名やrack属性は実際の取得結果から確認し、推測で固定しません。
 
 ## 導入
 
 1. [最新Release](https://github.com/disnana/newrelic-chatgpt-plugin/releases/latest)から `NewRelic-ChatGPT-setup-vX.Y.Z.zip` と `checksums.txt` を取得し、SHA-256を照合する。**初回Release前はこのリンクからZIPを取得できません**。開発者は下記のローカル生成手順を使えます。
 2. ChatGPT Sitesが利用可能で、Worker・D1・MCPを作成できる環境を用意する。New Relic側ではMCP機能と組織の読み取り権限が必要です。
 3. ZIPをChatGPTへ添付し、[セットアップ文](docs/setup.md)を使って**新しい所有者限定Site**を作る。既存ユーザーのSiteやPluginは使用しません。
-4. `DB` binding、2つのD1 migration、MCP capabilityを設定する。Siteごとに独立した暗号鍵を安全に生成して `NEW_RELIC_TOKEN_ENCRYPTION_KEY` Secretに保存する。値をチャット・Git・ログに出力しません。
+4. `DB` binding、3つのD1 migration、MCP capabilityを設定する。Siteごとに独立した暗号鍵を安全に生成して `NEW_RELIC_TOKEN_ENCRYPTION_KEY` Secretに保存する。値をチャット・Git・ログに出力しません。利用量を伴う読み取りは既定で無効です。
 5. 所有者限定でSiteを公開すると、Sitesが自分用Pluginを生成します。そのPluginを接続します。このソースZIP自体はPluginインポート用ZIPではありません。
 6. Siteでリージョンを選び、New Relic公式OAuthへ接続。localhostに戻ったURL全体を**Site内の認証完了ページ**に貼り付ける。認可URLはチャットに送信しません。
 7. アカウントを選択し、接続状態と読み取り専用クエリを確認する。終了時はSite内の接続解除を使う。New Relic側の認可取消しは別途必要です。
@@ -54,12 +54,16 @@ ScyllaDBの実際のメトリクス名を確認してから遅延を調べて
 Node.js 22、Python 3、bashを用意し、展開先で実行します。外部New Relicアカウントや秘密鍵は不要です。
 
 ```sh
+npm ci
 npm run build
-node scripts/validate-artifact.mjs
-node scripts/test-mcp.mjs
+npm run validate
+npm run typecheck
+npm run lint
+npm test
+npm audit --audit-level=high
 python3 scripts/test-migrations.py
 python3 scripts/check-distribution.py
-python3 scripts/package-release.py v0.3.0
+python3 scripts/package-release.py v0.4.0
 ```
 
 `outputs/` にZIPと `checksums.txt` を生成します。タグは `vX.Y.Z` のみを許可します。CIはPR・ブランチpushで検証し、Release workflowはVERSIONを変更したmainへのpush時だけCIを再実行してタグとZIPを公開します。Release作成ジョブのみ `contents: write` を持ちます。VERSIONの更新をmainへマージすると公開Releaseが作成されます。同じバージョンの再利用は拒否されます。
@@ -82,6 +86,6 @@ python3 scripts/package-release.py v0.3.0
 
 ## v0.4.0 development status
 
-OAuth failure classification and a fail-closed, schema-pinned generic MCP adapter are implemented. This is **not full official MCP parity**. The documented inventory contains 41 tools, but authenticated live schemas and new runtime execution remain unverified (0 live-verified generic tools). Most read calls can be CCU-metered. Write, destructive, billable and unreviewed tools remain disabled. Existing high-level tools remain available and retain their prior billing and safety limitations.
+OAuth failure classification and a fail-closed, schema-pinned generic MCP adapter are implemented. This is **not full official MCP parity**. The documented inventory contains 41 tools, but authenticated live schemas and new runtime execution remain unverified (0 live-verified generic tools). Legacy Core Compute reads default to disabled and require `NEW_RELIC_ENABLE_METERED_READS=true`; generic Core Compute and Advanced Compute tools require a pinned policy plus the matching explicit opt-in. Preview adds its own opt-in. Write and destructive operations remain disabled because per-operation user approval is not implemented. General self-host authentication is not implemented; the current identity model is for ChatGPT Sites only.
 
 See [migration and policy setup](docs/v0.4.0-migration.md), [official feature research](docs/official-mcp-research.md), [OAuth](docs/oauth.md), and [security review](docs/security-review.md). No production deployment is included.

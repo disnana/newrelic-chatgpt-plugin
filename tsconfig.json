@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "strict": false,
+    "strictNullChecks": true,
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022", "DOM"],
+    "skipLibCheck": true
+  },
+  "include": [
+    "worker/index.js",
+    "worker/newrelic.js",
+    "worker/mcp-policy.js",
+    "worker/nrql.js"
+  ],
+  "exclude": ["dist", "node_modules"]
+}

@@ -95,6 +95,7 @@
       </section>
 
       <p class="note"><strong>使い方：</strong>接続とアカウント選択の後は、iPhone版ChatGPTの通常チャットで「ScyllaDBの直近30分を調べて」のように頼めます。アカウントIDやNRQLを毎回入力する必要はありません。</p>
+      <p class="note"><strong>利用量：</strong>New Relic公式MCPの読み取りもCore Computeなどの利用量を消費する可能性があります。アカウント一覧やデータ取得は既定で無効です。Site管理者が契約を確認し、明示的に <code>NEW_RELIC_ENABLE_METERED_READS=true</code> を設定するまで公式データ読み取りを実行しません。</p>
       <footer>ChatGPT Sites MCP · New Relic公式MCPを読み取り専用で利用 · ログやチャットへOAuthトークンを出力しません</footer>
     </main>
     <script>

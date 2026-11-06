@@ -10,8 +10,11 @@
 
 ## 0.4.0 (development, not released)
 - Separate revoked grants from transient OAuth, permission, configuration, encryption and concurrency errors; preserve credentials on failures
-- Bound read-only 401 recovery, refresh rotation and cross-instance D1 leases; validate token/MCP response envelopes
+- Bound read-only 401 recovery, diagnose a repeated 401 after refresh, and fence late OAuth completion after disconnect
+- Add an incremental D1 migration for one-time OAuth completion claims; retain refresh rotation and cross-instance leases
+- Enforce default-off Core/Advanced Compute settings; validate schemas, bound request streams and cap UTF-8 tool output
 - Add live capability catalog and schema/metadata-pinned generic read adapter, with fail-closed policy and account gates
-- Keep billable, write/destructive, unknown and unreviewed functionality disabled; Preview additionally requires opt-in
+- Keep write/destructive, unknown and unreviewed functionality disabled; Core/Advanced Compute reads require matching opt-ins and Preview adds another gate
 - Document 41 official reference tools, billing limits and Advent feature availability without claiming live parity
-- Preserve Scylla investigation workflows; move model-initiated disconnect to owner UI confirmation
+- Preserve Scylla investigation workflows; retain Sites-only identity assumptions and document that general self-host authentication is not implemented
+- Add JavaScript checkJs type/null checking, full dependency audit and expanded mocked OAuth/MCP regression coverage

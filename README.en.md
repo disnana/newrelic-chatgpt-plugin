@@ -8,9 +8,9 @@ Unofficial, self-hosted integration by Disnana. Each user creates an owner-only 
 
 1. Download the setup ZIP and checksums from [Releases](https://github.com/disnana/newrelic-chatgpt-plugin/releases/latest). No downloadable Release exists before the first approved tag.
 2. Use a ChatGPT account with Sites, Worker, D1 and MCP support. Enable New Relic MCP access and the required organization read permissions.
-3. Attach the source ZIP to ChatGPT Sites and request a new owner-only Site. Configure the DB binding, both migrations, MCP capability, and an independently generated 32-byte base64url encryption key in the Site secret `NEW_RELIC_TOKEN_ENCRYPTION_KEY`. Never expose that key in chat or source.
+3. Attach the source ZIP to ChatGPT Sites and request a new owner-only Site. Configure the DB binding, all three migrations, MCP capability, and an independently generated 32-byte base64url encryption key in the Site secret `NEW_RELIC_TOKEN_ENCRYPTION_KEY`. Never expose that key in chat or source.
 4. Publish the Site owner-only and connect its generated Plugin. Select the New Relic region and complete OAuth. Paste the full localhost callback URL only into the Site's completion page, never into chat.
-5. Select an account and ask ChatGPT to inspect metrics, logs, alerts or execute bounded read-only NRQL. Disconnect through the Site when finished; revoke New Relic consent separately if required.
+5. Read-only New Relic MCP calls may consume Core Compute allocation, so account listing and data queries are disabled by default. Only after reviewing the contract and usage risk should the Site operator set `NEW_RELIC_ENABLE_METERED_READS=true`; then select an account and use the generated Plugin. Disconnect through the Site when finished; revoke New Relic consent separately if required.
 
 A full fresh-user installation has not been verified. See the Japanese setup guide for the exact setup prompt and troubleshooting. Sites availability depends on the user's account and environment.
 
@@ -19,12 +19,16 @@ A full fresh-user installation has not been verified. See the Japanese setup gui
 Requires Node.js 22, Python 3 and bash. No external credentials are needed for mock tests.
 
 ```sh
+npm ci
 npm run build
-node scripts/validate-artifact.mjs
-node scripts/test-mcp.mjs
+npm run validate
+npm run typecheck
+npm run lint
+npm test
+npm audit --audit-level=high
 python3 scripts/test-migrations.py
 python3 scripts/check-distribution.py
-python3 scripts/package-release.py v0.3.0
+python3 scripts/package-release.py v0.4.0
 ```
 
 CI runs on branch pushes and PRs. Only a change to `VERSION` pushed to main triggers tagging and Release creation after checks pass. Review before merging a version change.
@@ -37,6 +41,6 @@ Original code is MIT licensed. New Relic and OpenAI services and trademarks rema
 
 ## v0.4.0 development status
 
-OAuth failure classification and a fail-closed, schema-pinned generic MCP adapter are implemented. This is **not full official MCP parity**. The documented inventory contains 41 tools, but authenticated live schemas and new runtime execution remain unverified (0 live-verified generic tools). Most read calls can be CCU-metered. Write, destructive, billable and unreviewed tools remain disabled. Existing high-level tools remain available and retain their prior billing and safety limitations.
+OAuth failure classification and a fail-closed, schema-pinned generic MCP adapter are implemented. This is **not full official MCP parity**. The documented inventory contains 41 tools, but authenticated live schemas and new runtime execution remain unverified (0 live-verified generic tools). Legacy Core Compute reads default to disabled and require `NEW_RELIC_ENABLE_METERED_READS=true`; generic Core Compute and Advanced Compute tools require a pinned policy plus the matching explicit opt-in. Preview adds its own opt-in. Write and destructive operations remain disabled because per-operation user approval is not implemented. General self-host authentication is not implemented; the current identity model is for ChatGPT Sites only.
 
 See [migration and policy setup](docs/v0.4.0-migration.md), [official feature research](docs/official-mcp-research.md), [OAuth](docs/oauth.md), and [security review](docs/security-review.md). No production deployment is included.
