@@ -2,6 +2,10 @@ const encoder = new TextEncoder();
 const SESSION_TTL_MS = 15 * 60 * 1000;
 const PROPOSAL_TTL_MS = 5 * 60 * 1000;
 const CHALLENGE_TTL_MS = 90 * 1000;
+const SESSION_RETENTION_MS = 24 * 60 * 60 * 1000;
+const PROPOSAL_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const CLAIM_RECOVERY_GRACE_MS = 24 * 60 * 60 * 1000;
+const CLEANUP_BATCH_SIZE = 100;
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const HEX_HASH_PATTERN = /^[a-f0-9]{64}$/;
 const REGIONS = new Set(["us", "eu", "jp"]);
@@ -13,6 +17,44 @@ export class OperationApprovalError extends Error {
     this.code = code;
     this.status = status;
   }
+}
+
+/**
+ * Bounded, idempotent retention cleanup for D1. This function is intentionally
+ * not called by request handlers; a host must explicitly opt into a scheduled
+ * cleanup trigger. Expired actions become non-retryable before old records are
+ * purged, and encrypted arguments are cleared as soon as they are unusable.
+ * @param {{db: {prepare: Function, batch: Function}, now?: number}} options
+ */
+export async function cleanupOperationApprovalStore({ db, now = Date.now() }) {
+  if (!db || typeof db.prepare !== "function" || typeof db.batch !== "function") {
+    throw new TypeError("D1 batch binding is required for approval retention cleanup.");
+  }
+  validNow(now);
+  const proposalCutoff = Math.max(0, now - PROPOSAL_RETENTION_MS);
+  const sessionCutoff = Math.max(0, now - SESSION_RETENTION_MS);
+  const claimCutoff = Math.max(0, now - CLAIM_RECOVERY_GRACE_MS);
+  const result = await db.batch([
+    db.prepare(
+      "UPDATE nr_operation_proposals SET status = 'stale', encrypted_arguments = '', approval_nonce_hash = NULL, challenge_expires_at = NULL, finished_at = expires_at, result_code = 'expired' WHERE proposal_id IN (SELECT proposal_id FROM nr_operation_proposals WHERE status IN ('pending', 'approved') AND expires_at <= ? ORDER BY expires_at ASC LIMIT ?)",
+    ).bind(now, CLEANUP_BATCH_SIZE),
+    db.prepare(
+      "UPDATE nr_operation_proposals SET status = 'outcome_unknown', encrypted_arguments = '', approval_nonce_hash = NULL, challenge_expires_at = NULL, finished_at = claimed_at + ?, result_code = 'claim_stale_no_retry' WHERE proposal_id IN (SELECT proposal_id FROM nr_operation_proposals WHERE status = 'claimed' AND claimed_at <= ? ORDER BY claimed_at ASC LIMIT ?)",
+    ).bind(CLAIM_RECOVERY_GRACE_MS, claimCutoff, CLEANUP_BATCH_SIZE),
+    db.prepare(
+      "DELETE FROM nr_operation_proposals WHERE proposal_id IN (SELECT proposal_id FROM nr_operation_proposals WHERE status IN ('stale', 'cancelled', 'outcome_unknown', 'completed', 'failed') AND COALESCE(finished_at, expires_at) <= ? ORDER BY COALESCE(finished_at, expires_at) ASC LIMIT ?)",
+    ).bind(proposalCutoff, CLEANUP_BATCH_SIZE),
+    db.prepare(
+      "DELETE FROM nr_approval_sessions WHERE session_key_hash IN (SELECT session_key_hash FROM nr_approval_sessions WHERE COALESCE(revoked_at, expires_at) <= ? ORDER BY COALESCE(revoked_at, expires_at) ASC LIMIT ?)",
+    ).bind(sessionCutoff, CLEANUP_BATCH_SIZE),
+  ]);
+  const changes = result.map(item => Number(item?.meta?.changes || 0));
+  return {
+    expiredProposals: changes[0] || 0,
+    staleClaims: changes[1] || 0,
+    purgedProposals: changes[2] || 0,
+    purgedSessions: changes[3] || 0,
+  };
 }
 
 /** @returns {never} */
@@ -484,9 +526,12 @@ export function createOperationApprovalService({ db, encryptArguments, decryptAr
     await assertActiveSession(sessionKeyHash, userId, now());
     const currentNow = now();
     const result = await db.prepare(
-      "UPDATE nr_operation_proposals SET status = 'cancelled', approval_nonce_hash = NULL, challenge_expires_at = NULL, encrypted_arguments = '', finished_at = ?, result_code = 'owner_cancelled' WHERE proposal_id = ? AND user_id = ? AND session_key_hash = ? AND status IN ('pending', 'approved') AND account_id = ? AND region = ? AND connection_generation = ? AND selection_generation = ?",
-    ).bind(currentNow, proposalId, userId, sessionKeyHash, contextSnapshot.accountId,
-      contextSnapshot.region, contextSnapshot.connectionGeneration, contextSnapshot.selectionGeneration).run();
+      "UPDATE nr_operation_proposals SET session_key_hash = ?, status = 'cancelled', approval_nonce_hash = NULL, challenge_expires_at = NULL, encrypted_arguments = '', finished_at = ?, result_code = 'owner_cancelled' WHERE proposal_id = ? AND user_id = ? AND (session_key_hash = ? OR (session_key_hash IS NULL AND approval_nonce_hash IS NULL)) AND status IN ('pending', 'approved') AND account_id = ? AND region = ? AND connection_generation = ? AND selection_generation = ? AND EXISTS (SELECT 1 FROM nr_approval_sessions s WHERE s.session_key_hash = ? AND s.user_id = ? AND s.revoked_at IS NULL AND s.expires_at > ? AND s.created_at + ? > ?) AND EXISTS (SELECT 1 FROM nr_connections c INNER JOIN nr_preferences p ON p.user_id = c.user_id WHERE c.user_id = ? AND c.region = ? AND c.connection_generation = ? AND p.account_id = ? AND p.selection_generation = ?)",
+    ).bind(sessionKeyHash, currentNow, proposalId, userId, sessionKeyHash, contextSnapshot.accountId,
+      contextSnapshot.region, contextSnapshot.connectionGeneration, contextSnapshot.selectionGeneration,
+      sessionKeyHash, userId, currentNow, SESSION_TTL_MS, currentNow,
+      userId, contextSnapshot.region, contextSnapshot.connectionGeneration, contextSnapshot.accountId,
+      contextSnapshot.selectionGeneration).run();
     if (Number(result?.meta?.changes || 0) !== 1) fail("proposal_not_cancellable", 409);
     return { proposalId, status: "cancelled" };
   }
@@ -538,4 +583,12 @@ export function approvalCookieHeader(token, maxAgeSeconds = SESSION_TTL_MS / 100
   return "__Host-nr-approval=" + token + "; Max-Age=" + maxAgeSeconds + "; Path=/; Secure; HttpOnly; SameSite=Strict";
 }
 
-export const OPERATION_APPROVAL_LIMITS = Object.freeze({ sessionTtlMs: SESSION_TTL_MS, proposalTtlMs: PROPOSAL_TTL_MS, challengeTtlMs: CHALLENGE_TTL_MS });
+export const OPERATION_APPROVAL_LIMITS = Object.freeze({
+  sessionTtlMs: SESSION_TTL_MS,
+  proposalTtlMs: PROPOSAL_TTL_MS,
+  challengeTtlMs: CHALLENGE_TTL_MS,
+  sessionRetentionMs: SESSION_RETENTION_MS,
+  proposalRetentionMs: PROPOSAL_RETENTION_MS,
+  claimRecoveryGraceMs: CLAIM_RECOVERY_GRACE_MS,
+  cleanupBatchSize: CLEANUP_BATCH_SIZE,
+});

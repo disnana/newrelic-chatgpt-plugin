@@ -4,7 +4,12 @@ import { DatabaseSync } from "node:sqlite";
 import { webcrypto } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { resolve } from "node:path";
-import { createOperationApprovalService, OperationApprovalError } from "../worker/operation-approval.js";
+import {
+  cleanupOperationApprovalStore,
+  createOperationApprovalService,
+  OperationApprovalError,
+  OPERATION_APPROVAL_LIMITS,
+} from "../worker/operation-approval.js";
 import { approvalBrowserBinding, getOperationApprovalContext, saveSelectedAccount } from "../worker/newrelic.js";
 import { createSelfHostGateway } from "../examples/self-host-gateway/gateway.mjs";
 
@@ -13,17 +18,17 @@ const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const sqlite = new DatabaseSync(":memory:");
 const migrationFiles = [
   "0000_newrelic_mcp.sql", "0001_refresh_locks.sql", "0002_oauth_completion_fence.sql",
-  "0003_usage_consents.sql", "0004_operation_approval_store.sql",
+  "0003_usage_consents.sql", "0004_operation_approval_store.sql", "0005_approval_retention_indexes.sql",
 ];
 for (const migration of migrationFiles) {
   sqlite.exec(await readFile(resolve(root, "drizzle", migration), "utf8"));
 }
 
 class SQLiteD1 {
-  constructor() { this.beforeNextRun = null; }
+  constructor(database = sqlite) { this.sqlite = database; this.beforeNextRun = null; }
   prepare(query) {
     const database = this;
-    const statement = sqlite.prepare(query);
+    const statement = database.sqlite.prepare(query);
     let values = [];
     return {
       bind(...next) { values = next; return this; },
@@ -38,14 +43,14 @@ class SQLiteD1 {
     };
   }
   async batch(statements) {
-    sqlite.exec("BEGIN IMMEDIATE");
+    this.sqlite.exec("BEGIN IMMEDIATE");
     try {
       const results = [];
       for (const statement of statements) results.push(await statement.run());
-      sqlite.exec("COMMIT");
+      this.sqlite.exec("COMMIT");
       return results;
     } catch (error) {
-      sqlite.exec("ROLLBACK");
+      this.sqlite.exec("ROLLBACK");
       throw error;
     }
   }
@@ -166,6 +171,55 @@ await assert.rejects(() => service.issueChallenge({
   userId, sessionKeyHash: browserSession.sessionKeyHash, proposalId: created.proposalId,
   context: { ...context, selectionGeneration: "selection-generation-000000000002" },
 }), error => error instanceof OperationApprovalError && error.code === "proposal_context_changed");
+
+// The UI lists proposals before binding them to a browser. Cancellation must
+// bind this first browser atomically, while a different browser cannot cancel
+// a proposal after challenge issuance.
+const unboundCancelProposal = await service.createProposal({
+  userId, toolName: "demo_set_alert_threshold", args: syntheticArgs, context, billing: "core_compute",
+});
+assert.equal((await db.prepare("SELECT session_key_hash FROM nr_operation_proposals WHERE proposal_id = ?")
+  .bind(unboundCancelProposal.proposalId).first()).session_key_hash, null);
+assert.deepEqual(await service.cancel({ userId, sessionKeyHash: browserSession.sessionKeyHash,
+  proposalId: unboundCancelProposal.proposalId, context }),
+{ proposalId: unboundCancelProposal.proposalId, status: "cancelled" });
+const cancelledUnboundRow = await db.prepare("SELECT status, session_key_hash, encrypted_arguments FROM nr_operation_proposals WHERE proposal_id = ?")
+  .bind(unboundCancelProposal.proposalId).first();
+assert.equal(cancelledUnboundRow.status, "cancelled");
+assert.equal(cancelledUnboundRow.session_key_hash, browserSession.sessionKeyHash);
+assert.equal(cancelledUnboundRow.encrypted_arguments, "", "cancel clears encrypted arguments immediately");
+
+const sessionBoundCancelProposal = await service.createProposal({
+  userId, toolName: "demo_set_alert_threshold", args: syntheticArgs, context, billing: "core_compute",
+});
+const boundChallenge = await service.issueChallenge({ userId, sessionKeyHash: browserSession.sessionKeyHash,
+  proposalId: sessionBoundCancelProposal.proposalId, context });
+const otherBrowserSession = await createSession(sessionRequest());
+await assert.rejects(() => service.cancel({ userId, sessionKeyHash: otherBrowserSession.sessionKeyHash,
+  proposalId: sessionBoundCancelProposal.proposalId, context }),
+error => error instanceof OperationApprovalError && error.code === "proposal_not_cancellable");
+assert.deepEqual(await service.cancel({ userId, sessionKeyHash: browserSession.sessionKeyHash,
+  proposalId: sessionBoundCancelProposal.proposalId, context }),
+{ proposalId: sessionBoundCancelProposal.proposalId, status: "cancelled" });
+await assert.rejects(() => service.approve({ userId, sessionKeyHash: browserSession.sessionKeyHash,
+  proposalId: sessionBoundCancelProposal.proposalId, approvalNonce: boundChallenge.approvalNonce, context }),
+error => error instanceof OperationApprovalError && error.code === "proposal_not_pending");
+
+const revokeDuringCancelSession = await createSession(sessionRequest());
+const cancelRaceProposal = await service.createProposal({
+  userId, toolName: "demo_set_alert_threshold", args: syntheticArgs, context, billing: "core_compute",
+});
+db.beforeNextRun = query => {
+  assert.match(query, /SET session_key_hash = \?, status = 'cancelled'/);
+  sqlite.prepare("UPDATE nr_approval_sessions SET revoked_at = ? WHERE session_key_hash = ?")
+    .run(currentTime, revokeDuringCancelSession.sessionKeyHash);
+};
+await assert.rejects(() => service.cancel({ userId, sessionKeyHash: revokeDuringCancelSession.sessionKeyHash,
+  proposalId: cancelRaceProposal.proposalId, context }),
+error => error instanceof OperationApprovalError && error.code === "proposal_not_cancellable");
+assert.equal((await db.prepare("SELECT status FROM nr_operation_proposals WHERE proposal_id = ?")
+  .bind(cancelRaceProposal.proposalId).first()).status, "pending",
+"session revocation racing cancellation prevents the state change");
 
 const challenge = await service.issueChallenge({
   userId, sessionKeyHash: browserSession.sessionKeyHash, proposalId: created.proposalId, context,
@@ -456,4 +510,115 @@ const mcpAssertionBinding = await approvalBrowserBinding(new Request(externalOri
 assert.equal(mcpAssertionBinding, null);
 assert.equal(upstreamFetchCalls, 0, "approval session and state tests never call New Relic");
 
-console.log("D1-backed approval session, proposal, nonce CAS, and gateway session-binding tests passed; provider calls: 0");
+// The optional cleanup handler is inert by default and applies a bounded, idempotent retention policy.
+const cleanupSqlite = new DatabaseSync(":memory:");
+for (const migration of migrationFiles) cleanupSqlite.exec(await readFile(resolve(root, "drizzle", migration), "utf8"));
+const cleanupDb = new SQLiteD1(cleanupSqlite);
+const cleanupNow = Date.now();
+const cleanupContext = {
+  accountId: "synthetic-account", region: "us",
+  connectionGeneration: "cleanup-connection-generation",
+  selectionGeneration: "cleanup-selection-generation",
+};
+function insertCleanupSession(sessionHash, { createdAt, expiresAt, revokedAt = null }) {
+  cleanupSqlite.prepare("INSERT INTO nr_approval_sessions (session_key_hash, user_id, auth_mode, browser_binding_hash, csrf_hash, created_at, expires_at, revoked_at) VALUES (?, ?, 'sites', ?, ?, ?, ?, ?)")
+    .run(sessionHash, "cleanup-owner", "b".repeat(64), "c".repeat(64), createdAt, expiresAt, revokedAt);
+}
+function insertCleanupProposal({ id = token(18), status, expiresAt, createdAt = cleanupNow - 3600_000,
+  claimedAt = null, finishedAt = null, encryptedArguments = "synthetic-iv.ciphertext", resultCode = null }) {
+  cleanupSqlite.prepare("INSERT INTO nr_operation_proposals (proposal_id, user_id, session_key_hash, status, tool_name, operation, billing, region, account_id, connection_generation, selection_generation, schema_hash, policy_hash, arguments_hash, encrypted_arguments, effect_summary, approval_nonce_hash, challenge_expires_at, claim_id, created_at, expires_at, approved_at, claimed_at, finished_at, result_code) VALUES (?, ?, NULL, ?, 'synthetic_cleanup_tool', 'write', 'core_compute', ?, ?, ?, ?, ?, ?, ?, ?, 'synthetic retention fixture', NULL, NULL, ?, ?, ?, NULL, ?, ?, ?)")
+    .run(id, "cleanup-owner", status, cleanupContext.region, cleanupContext.accountId,
+      cleanupContext.connectionGeneration, cleanupContext.selectionGeneration,
+      "a".repeat(64), "d".repeat(64), "e".repeat(64), encryptedArguments,
+      status === "claimed" ? "claim-" + id.slice(0, 18) : null,
+      createdAt, expiresAt, claimedAt, finishedAt, resultCode);
+  return id;
+}
+const oldSessionHash = "1".repeat(64);
+const oldRevokedSessionHash = "2".repeat(64);
+const recentSessionHash = "3".repeat(64);
+insertCleanupSession(oldSessionHash, {
+  createdAt: cleanupNow - OPERATION_APPROVAL_LIMITS.sessionTtlMs - OPERATION_APPROVAL_LIMITS.sessionRetentionMs - 1000,
+  expiresAt: cleanupNow - OPERATION_APPROVAL_LIMITS.sessionRetentionMs - 1000,
+});
+insertCleanupSession(oldRevokedSessionHash, {
+  createdAt: cleanupNow - 2 * OPERATION_APPROVAL_LIMITS.sessionTtlMs,
+  expiresAt: cleanupNow + OPERATION_APPROVAL_LIMITS.sessionTtlMs,
+  revokedAt: cleanupNow - OPERATION_APPROVAL_LIMITS.sessionRetentionMs - 1000,
+});
+insertCleanupSession(recentSessionHash, {
+  createdAt: cleanupNow - OPERATION_APPROVAL_LIMITS.sessionTtlMs - OPERATION_APPROVAL_LIMITS.sessionRetentionMs + 1000,
+  expiresAt: cleanupNow - OPERATION_APPROVAL_LIMITS.sessionRetentionMs + 1000,
+});
+const expiredPendingId = insertCleanupProposal({ status: "pending", expiresAt: cleanupNow - 1000 });
+const expiredApprovedId = insertCleanupProposal({ status: "approved", expiresAt: cleanupNow - 2000 });
+const staleClaimId = insertCleanupProposal({ status: "claimed", expiresAt: cleanupNow - 3000,
+  claimedAt: cleanupNow - OPERATION_APPROVAL_LIMITS.claimRecoveryGraceMs - 1000 });
+const recentClaimId = insertCleanupProposal({ status: "claimed", expiresAt: cleanupNow - 4000,
+  claimedAt: cleanupNow - OPERATION_APPROVAL_LIMITS.claimRecoveryGraceMs + 1000 });
+const oldCancelledId = insertCleanupProposal({ status: "cancelled",
+  expiresAt: cleanupNow - OPERATION_APPROVAL_LIMITS.proposalRetentionMs - 2000,
+  finishedAt: cleanupNow - OPERATION_APPROVAL_LIMITS.proposalRetentionMs - 1000,
+  encryptedArguments: "" });
+const recentUnknownId = insertCleanupProposal({ status: "outcome_unknown", expiresAt: cleanupNow - 10_000,
+  finishedAt: cleanupNow - 24 * 60 * 60 * 1000, encryptedArguments: "", resultCode: "provider_outcome_unknown" });
+await worker.scheduled({}, { DB: cleanupDb, NEW_RELIC_OPERATION_APPROVAL_CLEANUP_ENABLED: "false" }, {
+  waitUntil() { throw new Error("disabled cleanup must not schedule work"); },
+});
+assert.equal((await cleanupDb.prepare("SELECT status FROM nr_operation_proposals WHERE proposal_id = ?")
+  .bind(expiredPendingId).first()).status, "pending", "cleanup remains inert unless explicitly enabled");
+let scheduledCleanup;
+await worker.scheduled({}, { DB: cleanupDb, NEW_RELIC_OPERATION_APPROVAL_CLEANUP_ENABLED: "true" }, {
+  waitUntil(promise) { scheduledCleanup = promise; },
+});
+assert.ok(scheduledCleanup, "enabled scheduled cleanup is dispatched through waitUntil");
+await scheduledCleanup;
+const expiredPendingRow = await cleanupDb.prepare("SELECT status, encrypted_arguments, approval_nonce_hash FROM nr_operation_proposals WHERE proposal_id = ?")
+  .bind(expiredPendingId).first();
+assert.equal(expiredPendingRow.status, "stale");
+assert.equal(expiredPendingRow.encrypted_arguments, "");
+assert.equal(expiredPendingRow.approval_nonce_hash, null);
+assert.equal((await cleanupDb.prepare("SELECT status, encrypted_arguments FROM nr_operation_proposals WHERE proposal_id = ?")
+  .bind(expiredApprovedId).first()).status, "stale");
+const staleClaimRow = await cleanupDb.prepare("SELECT status, encrypted_arguments, result_code FROM nr_operation_proposals WHERE proposal_id = ?")
+  .bind(staleClaimId).first();
+assert.equal(staleClaimRow.status, "outcome_unknown");
+assert.equal(staleClaimRow.encrypted_arguments, "");
+assert.equal(staleClaimRow.result_code, "claim_stale_no_retry");
+assert.equal((await cleanupDb.prepare("SELECT status FROM nr_operation_proposals WHERE proposal_id = ?")
+  .bind(recentClaimId).first()).status, "claimed", "active claim remains untouched inside its recovery grace");
+assert.equal(await cleanupDb.prepare("SELECT proposal_id FROM nr_operation_proposals WHERE proposal_id = ?")
+  .bind(oldCancelledId).first(), null, "terminal proposal metadata is purged after its retention window");
+assert.ok(await cleanupDb.prepare("SELECT proposal_id FROM nr_operation_proposals WHERE proposal_id = ?")
+  .bind(recentUnknownId).first(), "recent sanitized outcome metadata remains for review");
+assert.equal(await cleanupDb.prepare("SELECT session_key_hash FROM nr_approval_sessions WHERE session_key_hash = ?")
+  .bind(oldSessionHash).first(), null);
+assert.equal(await cleanupDb.prepare("SELECT session_key_hash FROM nr_approval_sessions WHERE session_key_hash = ?")
+  .bind(oldRevokedSessionHash).first(), null);
+assert.ok(await cleanupDb.prepare("SELECT session_key_hash FROM nr_approval_sessions WHERE session_key_hash = ?")
+  .bind(recentSessionHash).first(), "recent session records remain until the retention cutoff");
+const cleanupReplay = await cleanupOperationApprovalStore({ db: cleanupDb, now: cleanupNow });
+assert.deepEqual(cleanupReplay, { expiredProposals: 0, staleClaims: 0, purgedProposals: 0, purgedSessions: 0 },
+  "retention cleanup is idempotent");
+const expiryPlan = cleanupSqlite.prepare("EXPLAIN QUERY PLAN SELECT proposal_id FROM nr_operation_proposals WHERE status IN ('pending', 'approved') AND expires_at <= ? ORDER BY expires_at ASC LIMIT ?")
+  .all(cleanupNow, OPERATION_APPROVAL_LIMITS.cleanupBatchSize).map(row => row.detail).join(" ");
+assert.match(expiryPlan, /nr_operation_proposals_expiry_cleanup/);
+assert.doesNotMatch(expiryPlan, /USE TEMP B-TREE/);
+const terminalPlan = cleanupSqlite.prepare("EXPLAIN QUERY PLAN SELECT proposal_id FROM nr_operation_proposals WHERE status IN ('stale', 'cancelled', 'outcome_unknown', 'completed', 'failed') AND COALESCE(finished_at, expires_at) <= ? ORDER BY COALESCE(finished_at, expires_at) ASC LIMIT ?")
+  .all(cleanupNow, OPERATION_APPROVAL_LIMITS.cleanupBatchSize).map(row => row.detail).join(" ");
+assert.match(terminalPlan, /nr_operation_proposals_terminal_cleanup/);
+assert.doesNotMatch(terminalPlan, /USE TEMP B-TREE/);
+const backlogIds = Array.from({ length: OPERATION_APPROVAL_LIMITS.cleanupBatchSize + 1 }, () => insertCleanupProposal({
+  status: "pending", expiresAt: cleanupNow - 5000,
+}));
+const backlogFirst = await cleanupOperationApprovalStore({ db: cleanupDb, now: cleanupNow });
+assert.equal(backlogFirst.expiredProposals, OPERATION_APPROVAL_LIMITS.cleanupBatchSize,
+  "one cleanup run transitions at most the configured number of expired proposals");
+const backlogSecond = await cleanupOperationApprovalStore({ db: cleanupDb, now: cleanupNow });
+assert.equal(backlogSecond.expiredProposals, 1, "the next run drains the remaining expired row");
+for (const id of backlogIds) {
+  assert.equal((await cleanupDb.prepare("SELECT status FROM nr_operation_proposals WHERE proposal_id = ?").bind(id).first()).status, "stale");
+}
+console.log("PASS default-off bounded retention cleanup, ordered indexes, 100-row batches, secret clearing, stale-claim stop and idempotence");
+
+console.log("D1-backed approval session, proposal, nonce CAS, gateway binding and cleanup tests passed; provider calls: 0");

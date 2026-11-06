@@ -20,3 +20,6 @@
 - Add JavaScript checkJs type/null checking, full dependency audit and expanded mocked OAuth/MCP regression coverage
 - Add additive D1-backed approval session/proposal storage, browser CSRF/session binding, nonce single-use CAS, context generations and signed-proxy browser `sid` support; policy registry and dispatch remain disabled
 - Add synthetic SQLite-backed approval-state and gateway-session tests; no New Relic provider call is made
+- Add a user-triggered Site view of the live official tool catalog; it performs only MCP initialization/tools/list and renders policy summaries as text
+- Add a browser-only proposal review/one-time approval UI backed by existing session/CSRF endpoints; no proposal creation, MCP write tool or provider dispatch is enabled
+- Add an optional bounded D1 retention cleanup handler (24-hour session/claim windows, 30-day terminal proposal retention), with a separate default-off flag and no configured cron trigger

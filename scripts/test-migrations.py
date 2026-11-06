@@ -18,7 +18,10 @@ connection.execute(
 connection.execute("INSERT INTO nr_preferences VALUES (?, ?, ?, ?)", ("existing-user", "123", "prod", 60))
 connection.commit()
 connection.executescript((root / "drizzle" / "0003_usage_consents.sql").read_text(encoding="utf-8"))
-connection.executescript((root / "drizzle" / "0004_operation_approval_store.sql").read_text(encoding="utf-8"))
+published_0004 = (root / "drizzle" / "0004_operation_approval_store.sql").read_text(encoding="utf-8")
+assert "nr_operation_proposals_expiry_cleanup" not in published_0004
+connection.executescript(published_0004)
+connection.executescript((root / "drizzle" / "0005_approval_retention_indexes.sql").read_text(encoding="utf-8"))
 
 tables = {
     row[0]
@@ -66,6 +69,11 @@ assert {
     "encrypted_arguments", "effect_summary", "approval_nonce_hash", "challenge_expires_at", "claim_id", "created_at",
     "expires_at", "approved_at", "claimed_at", "finished_at", "result_code",
 } == proposal_columns
+proposal_indexes = {row[1] for row in connection.execute("PRAGMA index_list(nr_operation_proposals)")}
+assert {"nr_operation_proposals_expiry_cleanup", "nr_operation_proposals_claim_cleanup",
+        "nr_operation_proposals_terminal_cleanup"} <= proposal_indexes
+session_indexes = {row[1] for row in connection.execute("PRAGMA index_list(nr_approval_sessions)")}
+assert "nr_approval_sessions_retention_cleanup" in session_indexes
 try:
     connection.execute("INSERT INTO nr_usage_consents VALUES (?, ?, ?, ?)", ("existing-user", "unknown", 1, 2))
 except sqlite3.IntegrityError:
@@ -73,4 +81,4 @@ except sqlite3.IntegrityError:
 else:
     raise AssertionError("unknown consent capabilities must be rejected")
 
-print("D1 migrations passed SQLite syntax, additive-data preservation, consent checks, and schema checks")
+print("D1 migrations 0000–0005 passed SQLite syntax, additive-data preservation, consent, approval schema and cleanup-index checks")

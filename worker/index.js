@@ -37,7 +37,12 @@ import {
 
 import { capabilityCatalog, reviewReadTool, authorizeReadTool, validateToolResult, validateSchema, McpPolicyError } from "./mcp-policy.js";
 import { getUsageConsents, isValidUsageConsentChoices, updateUsageConsents } from "./usage-consent.js";
-import { approvalCookieHeader, createOperationApprovalService, OperationApprovalError } from "./operation-approval.js";
+import {
+  approvalCookieHeader,
+  cleanupOperationApprovalStore,
+  createOperationApprovalService,
+  OperationApprovalError,
+} from "./operation-approval.js";
 
 const MCP_VERSION = "2026-07-28";
 const MAX_REQUEST_BYTES = 16 * 1024;
@@ -938,6 +943,12 @@ function oauthErrorResponse(error) {
 }
 
 export default {
+  async scheduled(_controller, env, context) {
+    if (env.NEW_RELIC_OPERATION_APPROVAL_CLEANUP_ENABLED !== "true") return;
+    const cleanup = cleanupOperationApprovalStore({ db: env.DB });
+    if (context && typeof context.waitUntil === "function") context.waitUntil(cleanup);
+    else await cleanup;
+  },
   async fetch(request, env) {
     const { pathname } = new URL(request.url);
     if (pathname === "/mcp") {

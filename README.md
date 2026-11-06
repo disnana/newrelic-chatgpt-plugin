@@ -21,10 +21,11 @@ New RelicのCore Compute利用量の計測と追加料金は同じ意味では�
 1. [最新Release](https://github.com/disnana/newrelic-chatgpt-plugin/releases/latest)から `NewRelic-ChatGPT-setup-vX.Y.Z.zip` と `checksums.txt` を取得し、SHA-256を照合する。**初回Release前はこのリンクからZIPを取得できません**。開発者は下記のローカル生成手順を使えます。
 2. ChatGPT Sitesが利用可能で、Worker・D1・MCPを作成できる環境を用意する。New Relic側ではMCP機能と組織の読み取り権限が必要です。
 3. ZIPをChatGPTへ添付し、[セットアップ文](docs/setup.md)を使って**新しい所有者限定Site**を作る。既存ユーザーのSiteやPluginは使用しません。
-4. `DB` binding、4つのD1 migration、MCP capabilityを設定する。Siteごとに独立した暗号鍵を安全に生成して `NEW_RELIC_TOKEN_ENCRYPTION_KEY` Secretに保存する。値をチャット・Git・ログに出力しません。Core、Advanced、Previewの許可は既定ですべて無効です。
+4. `DB` binding、6つのD1 migration、MCP capabilityを設定する。Siteごとに独立した暗号鍵を安全に生成して `NEW_RELIC_TOKEN_ENCRYPTION_KEY` Secretに保存する。値をチャット・Git・ログに出力しません。Core、Advanced、Previewの許可は既定ですべて無効です。
 5. 所有者限定でSiteを公開すると、Sitesが自分用Pluginを生成します。そのPluginを接続します。このソースZIP自体はPluginインポート用ZIPではありません。
 6. Siteでリージョンを選び、New Relic公式OAuthへ接続。localhostに戻ったURL全体を**Site内の認証完了ページ**に貼り付ける。認可URLはチャットに送信しません。
-7. Siteの利用カテゴリごとの許可を確認し、必要な読み取りだけを選択して保存します。Core許可を有効にすると、通常のNRQL・アカウント一覧・メトリクス・ログ・アラートなどを使えます。Advanced許可はaCCU向けAI分析の別設定です。許可だけではNew Relic側の利用権や請求条件を確認できません。アカウントを選択し、読み取り専用クエリを確認します。終了時はSite内の接続解除を使うほか、利用カテゴリの許可を解除できます。New Relic側の認可取消しは別途必要です。
+7. Siteで必要なら「公式ツール一覧を取得」を明示的に押し、MCP tools/listだけを確認します。これはメトリクス・ログ・NRQLを読みませんが、期限切れ時に通常のOAuth更新を試す場合があります。再接続が必要なら利用者自身が公式OAuthを完了してください。
+8. Siteの利用カテゴリごとの許可を確認し、必要な読み取りだけを選択して保存します。Core許可を有効にすると、通常のNRQL・アカウント一覧・メトリクス・ログ・アラートなどを使えます。Advanced許可はaCCU向けAI分析の別設定です。許可だけではNew Relic側の利用権や請求条件を確認できません。アカウントを選択し、読み取り専用クエリを確認します。終了時はSite内の接続解除を使うほか、利用カテゴリの許可を解除できます。New Relic側の認可取消しは別途必要です。
 
 新しい第三者アカウントでの導入一式は未検証です。既存所有者環境での成功を、全ユーザー・全モバイル環境での動作保証と扱わないでください。Sitesの作成権限や表示はプラン・環境に依存します。
 

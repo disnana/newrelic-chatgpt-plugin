@@ -42,6 +42,11 @@
       .consent-option label { display:flex; align-items:flex-start; gap:12px; color:var(--text); }
       .consent-option input { width:20px; height:20px; margin:1px 0 0; accent-color:var(--accent); }
       .consent-option p { margin:8px 0 0 32px; font-size:.92rem; }
+      .result-list { margin:16px 0 0; padding:0; list-style:none; }
+      .result-item { margin-top:10px; padding:14px; border:1px solid var(--line); border-radius:12px; overflow-wrap:anywhere; }
+      .result-item strong { color:var(--text); }
+      .result-item p { margin-top:6px; }
+      .result-item button { margin:12px 8px 0 0; }
       .error { color:var(--bad) !important; }
       .note { margin:20px 2px 0; padding:16px 18px; border-left:3px solid var(--accent); border-radius:0 12px 12px 0; background:var(--soft); color:var(--muted); line-height:1.65; }
       .note strong { color:var(--text); }
@@ -100,6 +105,17 @@
         </div>
       </section>
 
+      <section class="card" aria-labelledby="catalog-title">
+        <h2 id="catalog-title">New Relic公式ツール一覧</h2>
+        <p>ボタンを押したときだけ、公式MCPの初期化とtools/listを行います。メトリクス・ログ・NRQLは読みません。期限切れの場合は、カタログ取得時に保存済みOAuthトークンの更新を試みることがあります。再接続が必要と表示されたら、上の公式OAuthから再接続してください。</p>
+        <p class="hint">ツール名や利用可否を確認できます。提供元の説明文は未信頼データとして扱い、このページでは表示しません。利用可否は現在の読み取り許可や未審査ポリシーも反映します。</p>
+        <div class="actions">
+          <button id="load-capabilities" type="button" class="secondary" disabled>公式ツール一覧を取得</button>
+        </div>
+        <p id="catalog-status" class="hint" role="status" aria-live="polite">まだ取得していません。New Relicへのカタログ要求は行っていません。</p>
+        <ul id="capability-list" class="result-list" aria-label="New Relic公式ツール一覧"></ul>
+      </section>
+
       <section class="card" aria-labelledby="usage-title">
         <h2 id="usage-title">利用カテゴリごとの許可</h2>
         <p>New Relicの契約・料金モデルはこの連携から確認できません。CCU/aCCUの計測があることだけで、追加料金が発生するとは限りません。利用量が契約に含まれるか、別料金になるかはNew Relicアカウントの契約条件で決まります。</p>
@@ -126,8 +142,13 @@
 
       <section class="card" aria-labelledby="operations-title">
         <h2 id="operations-title">書き込み・破壊的操作</h2>
-        <p>このバージョンでは、New Relicのアラート、しきい値、ルーティング、エンティティなどを変更する操作は提供していません。利用カテゴリごとの許可は読み取りだけに適用され、書き込みの承認にはなりません。</p>
-        <p class="hint">将来の変更操作には、対象と影響の表示、本人による期限付きの1回限りの承認、リプレイ防止、接続変更時の失効が別途必要です。ここから操作を申請・実行することはできません。</p>
+        <p>このバージョンでは、New Relicのアラート、しきい値、ルーティング、エンティティなどを変更する操作は提供していません。利用カテゴリごとの許可は読み取りだけに適用され、書き込みの承認にはなりません。承認用APIは既定で無効で、申請作成やNew Relicへの変更送信経路もありません。</p>
+        <p class="hint">必要なら下のボタンで、現在のブラウザーに結び付いた短時間の承認セッションを開始し、保留中の提案だけ確認できます。これは本人確認プロバイダーでの再ログインではなく、申請や実行を有効にするものでもありません。</p>
+        <div class="actions">
+          <button id="load-approvals" type="button" class="secondary" disabled>保留中の提案を確認</button>
+        </div>
+        <p id="approval-status" class="hint" role="status" aria-live="polite">まだ確認していません。承認セッションは作成していません。</p>
+        <ul id="approval-list" class="result-list" aria-label="保留中の変更提案"></ul>
       </section>
 
       <p class="note"><strong>使い方：</strong>接続とアカウント選択の後は、iPhone版ChatGPTの通常チャットで「ScyllaDBの直近30分を調べて」のように頼めます。アカウントIDやNRQLを毎回入力する必要はありません。</p>
@@ -152,7 +173,18 @@
       const usageForm = document.querySelector("#usage-form");
       const usageStatus = document.querySelector("#usage-status");
       const saveUsageConsentButton = document.querySelector("#save-usage-consent");
+      const catalogButton = document.querySelector("#load-capabilities");
+      const catalogStatus = document.querySelector("#catalog-status");
+      const capabilityList = document.querySelector("#capability-list");
+      const approvalButton = document.querySelector("#load-approvals");
+      const approvalStatus = document.querySelector("#approval-status");
+      const approvalList = document.querySelector("#approval-list");
       let usageConsentState = null;
+      let approvalCsrfToken = null;
+      let catalogRequestInFlight = false;
+      let approvalRequestInFlight = false;
+      let lastAuthenticated = false;
+      let lastConnectionReady = false;
       const requestedRegion = new URL(window.location.href).searchParams.get("connect_region");
       if (["us", "eu", "jp"].includes(requestedRegion)) {
         regionSelect.value = requestedRegion;
@@ -161,7 +193,7 @@
       }
 
       async function api(path, options) {
-        const response = await fetch(path, Object.assign({ cache: "no-store" }, options || {}));
+        const response = await fetch(path, Object.assign({ cache: "no-store", credentials: "same-origin" }, options || {}));
         const data = await response.json();
         if (!response.ok) {
           const error = new Error(data.error || "リクエストに失敗しました。");
@@ -169,6 +201,192 @@
           throw error;
         }
         return data;
+      }
+
+      function setCatalogStatus(message, isError = false) {
+        catalogStatus.textContent = message;
+        catalogStatus.classList.toggle("error", isError);
+      }
+
+      function clearCapabilityRows() {
+        capabilityList.replaceChildren();
+      }
+
+      function renderCapabilities(data) {
+        clearCapabilityRows();
+        if (!Array.isArray(data.tools)) throw new Error("公式ツール一覧の形式を確認できませんでした。");
+        let availableCount = 0;
+        for (const tool of data.tools.slice(0, 100)) {
+          if (!tool || typeof tool.name !== "string") continue;
+          const item = document.createElement("li");
+          item.className = "result-item";
+          const title = document.createElement("strong");
+          title.textContent = tool.name.slice(0, 128);
+          const details = document.createElement("p");
+          const operation = ["read", "write", "destructive", "unknown"].includes(tool.operation) ? tool.operation : "unknown";
+          const billing = ["none", "core_compute", "advanced_compute", "unknown"].includes(tool.billing) ? tool.billing : "unknown";
+          const available = tool.available === true;
+          if (available) availableCount += 1;
+          details.textContent = operation + " · " + billing + " · "
+            + (available ? "現在の読み取り許可で利用可能" : "利用不可: " + (typeof tool.reason === "string" ? tool.reason : "unreviewed"));
+          item.append(title, details);
+          capabilityList.append(item);
+        }
+        const suffix = data.truncated === true ? " 一覧は上限のため一部のみです。" : "";
+        setCatalogStatus(data.tools.length + "件の公式ツール定義を受け取りました。現在利用可能: " + availableCount + "件。" + suffix);
+      }
+
+      async function loadCapabilities() {
+        if (catalogRequestInFlight || catalogButton.disabled) return;
+        catalogRequestInFlight = true;
+        catalogButton.disabled = true;
+        setCatalogStatus("公式MCPからツール定義を取得しています…");
+        try {
+          renderCapabilities(await api("/api/capabilities"));
+        } catch (error) {
+          clearCapabilityRows();
+          setCatalogStatus(formatError(error) + " データ読み取りは行っていません。", true);
+        } finally {
+          catalogRequestInFlight = false;
+          catalogButton.disabled = !lastConnectionReady;
+        }
+      }
+
+      function setApprovalStatus(message, isError = false) {
+        approvalStatus.textContent = message;
+        approvalStatus.classList.toggle("error", isError);
+      }
+
+      function approvalCsrfHeaders() {
+        if (typeof approvalCsrfToken !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(approvalCsrfToken)) {
+          throw new Error("承認セッションがありません。もう一度確認してください。");
+        }
+        return { "x-approval-csrf": approvalCsrfToken };
+      }
+
+      async function approvalPost(path, body, includeCsrf = false) {
+        const headers = { "content-type": "application/json" };
+        if (includeCsrf) Object.assign(headers, approvalCsrfHeaders());
+        return api(path, { method: "POST", headers, body: JSON.stringify(body) });
+      }
+
+      function appendApprovalAction(parent, label, handler, className = "secondary") {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = className;
+        button.textContent = label;
+        button.addEventListener("click", async () => {
+          if (button.disabled) return;
+          button.disabled = true;
+          let keepDisabled = false;
+          try { keepDisabled = await handler() === true; }
+          catch (error) { setApprovalStatus(formatError(error), true); }
+          finally { button.disabled = keepDisabled; }
+        });
+        parent.append(button);
+        return button;
+      }
+
+      function disableApprovalActions(item) {
+        for (const button of item.querySelectorAll("button")) button.disabled = true;
+      }
+
+      async function showApprovalChallenge(item, proposal) {
+        setApprovalStatus("確認用の1回限りのチャレンジを取得しています…");
+        let challenge;
+        try {
+          challenge = await approvalPost("/api/operation-approvals/challenge", { proposalId: proposal.proposalId }, true);
+        } catch {
+          approvalCsrfToken = null;
+          disableApprovalActions(item);
+          setApprovalStatus("確認応答を受け取れませんでした。チャレンジが作成済みの場合は90秒で期限切れになります。New Relicへの変更は送っていません。再読込して、期限後に確認し直してください。", true);
+          return true;
+        }
+        if (typeof challenge.approvalNonce !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(challenge.approvalNonce)
+          || !Number.isFinite(challenge.challengeExpiresAt)) throw new Error("確認チャレンジを検証できませんでした。");
+        const exactEffect = document.createElement("p");
+        exactEffect.textContent = "承認対象: " + challenge.effectSummary + " チャレンジ有効期限: "
+          + new Date(challenge.challengeExpiresAt).toLocaleString("ja-JP");
+        item.append(exactEffect);
+        appendApprovalAction(item, "この提案を1回だけ承認", async () => {
+          if (Date.now() >= challenge.challengeExpiresAt) {
+            approvalCsrfToken = null;
+            disableApprovalActions(item);
+            setApprovalStatus("確認時間が切れました。New Relicへの変更は送っていません。再読込して一覧を確認してください。", true);
+            return true;
+          }
+          try {
+            const result = await approvalPost("/api/operation-approvals/approve", {
+              proposalId: proposal.proposalId, approvalNonce: challenge.approvalNonce,
+            }, true);
+            approvalCsrfToken = null;
+            item.remove();
+            setApprovalStatus(result.message || "承認を記録しました。New Relicへの変更は送っていません。");
+          } catch (error) {
+            approvalCsrfToken = null;
+            disableApprovalActions(item);
+            setApprovalStatus("承認結果を確認できません。再送はしないでください。このバージョンはNew Relicへの変更を送りません。ページを再読込して保留状態を確認してください。 " + formatError(error), true);
+            return true;
+          }
+        });
+        setApprovalStatus("提案の対象を確認してください。承認操作は記録だけで、変更は送信されません。");
+        return true;
+      }
+
+      function renderApprovals(data) {
+        approvalList.replaceChildren();
+        if (!Array.isArray(data.items)) throw new Error("承認一覧の形式を確認できませんでした。");
+        if (data.items.length === 0) {
+          setApprovalStatus("保留中の提案はありません。このページから変更提案を作成したり、New Relicへ変更を送ったりすることはできません。");
+          return;
+        }
+        for (const proposal of data.items.slice(0, 20)) {
+          if (!proposal || typeof proposal.proposalId !== "string" || typeof proposal.effectSummary !== "string") continue;
+          if (!proposal.account || typeof proposal.account.id !== "string" || typeof proposal.account.region !== "string"
+            || !["write", "destructive"].includes(proposal.operation)
+            || !["none", "core_compute", "advanced_compute"].includes(proposal.billing)) continue;
+          const item = document.createElement("li");
+          item.className = "result-item";
+          const title = document.createElement("strong");
+          title.textContent = proposal.operation + " · " + proposal.billing + " · "
+            + proposal.account?.region + " / " + proposal.account?.id;
+          const summary = document.createElement("p");
+          summary.textContent = proposal.effectSummary;
+          item.append(title, summary);
+          appendApprovalAction(item, "対象と影響を確認", () => showApprovalChallenge(item, proposal));
+          appendApprovalAction(item, "提案をキャンセル", async () => {
+            await approvalPost("/api/operation-approvals/cancel", { proposalId: proposal.proposalId }, true);
+            approvalCsrfToken = null;
+            item.remove();
+            setApprovalStatus("提案をキャンセルしました。New Relicへの変更は送っていません。");
+          });
+          approvalList.append(item);
+        }
+        setApprovalStatus("保留中の提案を表示しています。表示された対象と影響以外は承認できません。");
+      }
+
+      async function loadApprovals() {
+        if (approvalRequestInFlight || approvalButton.disabled) return;
+        approvalRequestInFlight = true;
+        approvalButton.disabled = true;
+        approvalCsrfToken = null;
+        approvalList.replaceChildren();
+        setApprovalStatus("短時間のブラウザー承認セッションを開始しています…");
+        try {
+          const session = await approvalPost("/api/operation-approvals/session", {});
+          if (typeof session.csrfToken !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(session.csrfToken)) {
+            throw new Error("承認セッションを検証できませんでした。");
+          }
+          approvalCsrfToken = session.csrfToken;
+          renderApprovals(await approvalPost("/api/operation-approvals/list", {}, true));
+        } catch (error) {
+          approvalCsrfToken = null;
+          approvalList.replaceChildren();
+          setApprovalStatus(formatError(error) + " 承認機能は既定で停止中です。再試行前に接続状態を確認してください。", true);
+        } finally {
+          approvalRequestInFlight = false;
+          approvalButton.disabled = !lastAuthenticated;
+        }
       }
 
       function setStatus(state, message) {
@@ -262,6 +480,10 @@
         connectedPanel.hidden = true;
         accountControls.hidden = true;
         selectAccountButton.disabled = true;
+        lastAuthenticated = false;
+        lastConnectionReady = false;
+        catalogButton.disabled = true;
+        approvalButton.disabled = true;
         try {
           const state = await api("/api/status");
           if (!state.authenticated) {
@@ -270,6 +492,8 @@
             identityHint.hidden = false;
             return;
           }
+          lastAuthenticated = true;
+          approvalButton.disabled = false;
           if (!state.connected) {
             setStatus("disconnected", "New Relic未接続");
             connectPanel.hidden = false;
@@ -290,6 +514,8 @@
             return;
           }
           setStatus("connected", "New Relic接続情報を保存済み（有効性未確認）");
+          lastConnectionReady = !state.refreshError;
+          catalogButton.disabled = !lastConnectionReady;
           const date = state.connectedAt ? new Date(state.connectedAt).toLocaleString("ja-JP") : "";
           const region = ["us", "eu", "jp"].includes(state.region) ? state.region : "us";
           regionSelect.value = region;
@@ -305,6 +531,10 @@
           setStatus("error", "状態を取得できません");
           identityHint.textContent = formatError(error);
           identityHint.hidden = false;
+          catalogButton.disabled = true;
+          approvalButton.disabled = true;
+          lastAuthenticated = false;
+          lastConnectionReady = false;
         }
       }
 
@@ -313,6 +543,8 @@
         reconnectLink.href = connectLink.href;
       });
       document.querySelector("#refresh").addEventListener("click", refresh);
+      catalogButton.addEventListener("click", loadCapabilities);
+      approvalButton.addEventListener("click", loadApprovals);
       usageForm.addEventListener("submit", async (event) => {
         event.preventDefault();
         saveUsageConsentButton.disabled = true;

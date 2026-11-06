@@ -29,6 +29,20 @@
       "when": 1794009600000,
       "tag": "0003_usage_consents",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1794096000000,
+      "tag": "0004_operation_approval_store",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1794182400000,
+      "tag": "0005_approval_retention_indexes",
+      "breakpoints": true
     }
   ]
 }
