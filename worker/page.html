@@ -47,6 +47,7 @@
       .result-item strong { color:var(--text); }
       .result-item p { margin-top:6px; }
       .result-item button { margin:12px 8px 0 0; }
+      .schema-preview { max-height:24rem; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; font-size:.82rem; }
       .error { color:var(--bad) !important; }
       .note { margin:20px 2px 0; padding:16px 18px; border-left:3px solid var(--accent); border-radius:0 12px 12px 0; background:var(--soft); color:var(--muted); line-height:1.65; }
       .note strong { color:var(--text); }
@@ -108,12 +109,15 @@
       <section class="card" aria-labelledby="catalog-title">
         <h2 id="catalog-title">New Relic公式ツール一覧</h2>
         <p>ボタンを押したときだけ、公式MCPの初期化とtools/listを行います。メトリクス・ログ・NRQLは読みません。期限切れの場合は、カタログ取得時に保存済みOAuthトークンの更新を試みることがあります。再接続が必要と表示されたら、上の公式OAuthから再接続してください。</p>
-        <p class="hint">ツール名や利用可否を確認できます。提供元の説明文は未信頼データとして扱い、このページでは表示しません。利用可否は現在の読み取り許可や未審査ポリシーも反映します。</p>
+        <p class="hint">ツール名、読み取り区分、利用可否をページごとに確認できます。個別に開いた説明文・スキーマは提供元の未信頼データとしてプレーンテキスト表示します。利用可否は現在の読み取り許可や未審査ポリシーも反映します。</p>
         <div class="actions">
           <button id="load-capabilities" type="button" class="secondary" disabled>公式ツール一覧を取得</button>
         </div>
         <p id="catalog-status" class="hint" role="status" aria-live="polite">まだ取得していません。New Relicへのカタログ要求は行っていません。</p>
         <ul id="capability-list" class="result-list" aria-label="New Relic公式ツール一覧"></ul>
+        <div class="actions">
+          <button id="load-more-capabilities" type="button" class="secondary" hidden>次のページを読み込む</button>
+        </div>
       </section>
 
       <section class="card" aria-labelledby="usage-title">
@@ -176,12 +180,19 @@
       const catalogButton = document.querySelector("#load-capabilities");
       const catalogStatus = document.querySelector("#catalog-status");
       const capabilityList = document.querySelector("#capability-list");
+      const loadMoreCapabilitiesButton = document.querySelector("#load-more-capabilities");
       const approvalButton = document.querySelector("#load-approvals");
       const approvalStatus = document.querySelector("#approval-status");
       const approvalList = document.querySelector("#approval-list");
       let usageConsentState = null;
       let approvalCsrfToken = null;
       let catalogRequestInFlight = false;
+      let catalogRequestGeneration = 0;
+      let catalogSnapshot = null;
+      let catalogNextOffset = null;
+      let catalogDiscovered = 0;
+      let catalogLoaded = 0;
+      let catalogAvailable = 0;
       let approvalRequestInFlight = false;
       let lastAuthenticated = false;
       let lastConnectionReady = false;
@@ -221,13 +232,30 @@
 
       function clearCapabilityRows() {
         capabilityList.replaceChildren();
+        loadMoreCapabilitiesButton.hidden = true;
+        loadMoreCapabilitiesButton.disabled = false;
+        catalogSnapshot = null;
+        catalogNextOffset = null;
+        catalogDiscovered = 0;
+        catalogLoaded = 0;
+        catalogAvailable = 0;
       }
 
-      function renderCapabilities(data) {
-        clearCapabilityRows();
-        if (!Array.isArray(data.tools)) throw new Error("公式ツール一覧の形式を確認できませんでした。");
-        let availableCount = 0;
-        for (const tool of data.tools.slice(0, 100)) {
+      function renderCapabilities(data, append = false) {
+        if (!Array.isArray(data.items) || typeof data.snapshot !== "string"
+          || !/^[a-f0-9]{64}$/.test(data.snapshot) || !Number.isSafeInteger(data.discovered)
+          || !Number.isSafeInteger(data.offset) || !Number.isSafeInteger(data.nextOffset) && data.nextOffset !== null) {
+          throw new Error("公式ツール一覧の形式を確認できませんでした。");
+        }
+        if (append && (data.snapshot !== catalogSnapshot || data.offset !== catalogNextOffset)) {
+          throw new Error("公式MCPの一覧が更新されました。最初のページから読み込み直してください。");
+        }
+        if (!append) {
+          clearCapabilityRows();
+          catalogSnapshot = data.snapshot;
+        }
+        catalogDiscovered = data.discovered;
+        for (const tool of data.items) {
           if (!tool || typeof tool.name !== "string") continue;
           const item = document.createElement("li");
           item.className = "result-item";
@@ -236,30 +264,102 @@
           const details = document.createElement("p");
           const operation = ["read", "write", "destructive", "unknown"].includes(tool.operation) ? tool.operation : "unknown";
           const billing = ["none", "core_compute", "advanced_compute", "unknown"].includes(tool.billing) ? tool.billing : "unknown";
+          const scope = ["account", "identity", "unknown"].includes(tool.scope) ? tool.scope : "unknown";
           const available = tool.available === true;
-          if (available) availableCount += 1;
-          details.textContent = operation + " · " + billing + " · "
+          const preview = tool.preview === true ? "Preview" : tool.preview === false ? "通常" : "Preview不明";
+          if (available) catalogAvailable += 1;
+          catalogLoaded += 1;
+          details.textContent = operation + " · " + billing + " · " + scope + " · " + preview + " · "
             + (available ? "現在の読み取り許可で利用可能" : "利用不可: " + (typeof tool.reason === "string" ? tool.reason : "unreviewed"));
-          item.append(title, details);
+          const schemaButton = document.createElement("button");
+          schemaButton.type = "button";
+          schemaButton.className = "secondary";
+          schemaButton.textContent = "説明と入力スキーマを確認";
+          schemaButton.disabled = typeof tool.schemaHash !== "string" || !/^[a-f0-9]{64}$/.test(tool.schemaHash);
+          const schemaPanel = document.createElement("div");
+          schemaPanel.hidden = true;
+          const schemaStatus = document.createElement("p");
+          const schemaDescription = document.createElement("p");
+          const schemaPreview = document.createElement("pre");
+          schemaPreview.className = "schema-preview";
+          schemaPanel.append(schemaStatus, schemaDescription, schemaPreview);
+          schemaButton.addEventListener("click", async () => {
+            if (schemaPanel.dataset.loaded === "true") {
+              schemaPanel.hidden = !schemaPanel.hidden;
+              schemaButton.textContent = schemaPanel.hidden ? "説明と入力スキーマを確認" : "スキーマを隠す";
+              return;
+            }
+            schemaButton.disabled = true;
+            schemaPanel.hidden = false;
+            schemaStatus.classList.remove("error");
+            schemaStatus.textContent = "選択したツールのスキーマを取得しています…";
+            const detailPath = "/api/capabilities?name=" + encodeURIComponent(tool.name)
+              + "&schemaHash=" + encodeURIComponent(tool.schemaHash)
+              + "&snapshot=" + encodeURIComponent(catalogSnapshot);
+            try {
+              const result = await api(detailPath);
+              if (!result.tool || result.tool.name !== tool.name || result.snapshot !== catalogSnapshot) {
+                throw new Error("カタログが更新されました。最初のページから読み込み直してください。");
+              }
+              schemaDescription.textContent = result.tool.description || "提供元の説明はありません。";
+              schemaPreview.textContent = JSON.stringify({
+                inputSchema: result.tool.inputSchema,
+                outputSchema: result.tool.outputSchema,
+              }, null, 2);
+              schemaStatus.textContent = result.tool.schemaWasRedacted || result.tool.outputSchemaWasRedacted
+                || result.tool.descriptionWasRedacted
+                ? "秘密情報らしい文字列をマスクしています。説明とスキーマは提供元の未信頼データです。"
+                : "説明とスキーマは提供元の未信頼データです。これを実行許可として扱いません。";
+              schemaPanel.dataset.loaded = "true";
+              schemaPanel.hidden = false;
+              schemaButton.textContent = "スキーマを隠す";
+            } catch (error) {
+              schemaStatus.textContent = formatError(error);
+              schemaStatus.classList.add("error");
+              schemaPanel.hidden = false;
+            } finally {
+              schemaButton.disabled = false;
+            }
+          });
+          item.append(title, details, schemaButton, schemaPanel);
           capabilityList.append(item);
         }
-        const suffix = data.truncated === true ? " 一覧は上限のため一部のみです。" : "";
-        setCatalogStatus(data.tools.length + "件の公式ツール定義を受け取りました。現在利用可能: " + availableCount + "件。" + suffix);
+        catalogNextOffset = data.nextOffset;
+        loadMoreCapabilitiesButton.hidden = catalogNextOffset === null;
+        loadMoreCapabilitiesButton.disabled = false;
+        setCatalogStatus(catalogLoaded + "/" + catalogDiscovered + "件を表示しています。現在利用可能: " + catalogAvailable + "件。スキーマ詳細は個別に選んだときだけ取得します。");
       }
 
-      async function loadCapabilities() {
-        if (catalogRequestInFlight || catalogButton.disabled) return;
+      async function loadCapabilities(loadMore = false) {
+        if (catalogRequestInFlight || !lastConnectionReady || loadMore && catalogNextOffset === null) return;
         catalogRequestInFlight = true;
+        const generation = ++catalogRequestGeneration;
         catalogButton.disabled = true;
-        setCatalogStatus("公式MCPからツール定義を取得しています…");
-        try {
-          renderCapabilities(await api("/api/capabilities"));
-        } catch (error) {
+        loadMoreCapabilitiesButton.disabled = true;
+        const offset = loadMore ? catalogNextOffset : 0;
+        const snapshot = loadMore ? catalogSnapshot : null;
+        const path = "/api/capabilities?offset=" + offset + "&limit=20"
+          + (snapshot ? "&snapshot=" + encodeURIComponent(snapshot) : "");
+        if (!loadMore) {
           clearCapabilityRows();
-          setCatalogStatus(formatError(error) + " データ読み取りは行っていません。", true);
+          setCatalogStatus("公式MCPからツール一覧を取得しています…");
+        } else {
+          setCatalogStatus("公式MCPから次のページを取得しています…");
+        }
+        try {
+          const data = await api(path);
+          if (generation === catalogRequestGeneration) renderCapabilities(data, loadMore);
+        } catch (error) {
+          if (generation === catalogRequestGeneration) {
+            if (error.errorCode === "catalog_changed") clearCapabilityRows();
+            setCatalogStatus(formatError(error) + " テレメトリーデータは読み取っていません。", true);
+          }
         } finally {
-          catalogRequestInFlight = false;
-          catalogButton.disabled = !lastConnectionReady;
+          if (generation === catalogRequestGeneration) {
+            catalogRequestInFlight = false;
+            catalogButton.disabled = !lastConnectionReady;
+            loadMoreCapabilitiesButton.disabled = false;
+          }
         }
       }
 
@@ -485,6 +585,10 @@
       }
 
       async function refresh() {
+        catalogRequestGeneration += 1;
+        catalogRequestInFlight = false;
+        clearCapabilityRows();
+        setCatalogStatus("状態を再確認しています。公式ツール一覧は未取得です。");
         setStatus("loading", "接続状態を確認しています…");
         identityHint.hidden = true;
         connectPanel.hidden = true;
@@ -554,7 +658,8 @@
         reconnectLink.href = connectLink.href;
       });
       document.querySelector("#refresh").addEventListener("click", refresh);
-      catalogButton.addEventListener("click", loadCapabilities);
+      catalogButton.addEventListener("click", () => loadCapabilities(false));
+      loadMoreCapabilitiesButton.addEventListener("click", () => loadCapabilities(true));
       approvalButton.addEventListener("click", loadApprovals);
       usageForm.addEventListener("submit", async (event) => {
         event.preventDefault();

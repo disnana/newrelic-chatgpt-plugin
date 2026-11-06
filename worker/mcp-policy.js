@@ -130,9 +130,12 @@ export async function capabilityCatalog(tools,env,usageConsents={}) {
     let reason=null;
     let fingerprint=null;
     try {
+      // Keep a stable fingerprint even when the schema uses a keyword that
+      // this adapter does not support. The catalog can then show the actual
+      // schema for review without making it executable.
+      fingerprint=await schemaFingerprint(tool);
       checkSchema(tool.inputSchema);
       if(tool.outputSchema) checkSchema(tool.outputSchema);
-      fingerprint=await schemaFingerprint(tool);
     } catch { reason='unsupported_schema'; }
     if(!reason) {
       if(!policy) reason='policy_not_reviewed';

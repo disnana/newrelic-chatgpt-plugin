@@ -10,7 +10,7 @@ const workerPath = resolve(root, "dist/server/index.js");
 const worker = (await import(pathToFileURL(workerPath).href + "?test=" + Date.now())).default;
 const { normalizeNrql, buildComparisonNrql, validateLogFilter, validateLogWindow, filterMetricNames } =
   await import(pathToFileURL(resolve(root, "worker/nrql.js")).href + "?test=" + Date.now());
-const { schemaFingerprint } = await import(pathToFileURL(resolve(root, "worker/mcp-policy.js")).href + "?test=" + Date.now());
+const { schemaFingerprint, canonicalJson } = await import(pathToFileURL(resolve(root, "worker/mcp-policy.js")).href + "?test=" + Date.now());
 const { beginNewRelicAuthorization, completePastedNewRelicAuthorization, disconnectNewRelic, decryptSecret, encryptSecret, siteUserId, approvalBrowserBinding, getConnectionStatus, withNewRelicSession, findNewRelicTool } =
   await import(pathToFileURL(resolve(root, "worker/newrelic.js")).href + "?test=" + Date.now());
 const { updateUsageConsents } = await import(pathToFileURL(resolve(root, "worker/usage-consent.js")).href + "?test=" + Date.now());
@@ -200,6 +200,9 @@ for (const name of [
   "investigate_latency",
   "compare_time_ranges",
 ]) assert.ok(toolNames.includes(name), "Missing MCP tool " + name);
+assert.equal(listed.payload.result.tools.find(tool => tool.name === "get_mcp_capability_schema")
+  .inputSchema.properties.offset.maximum, 1024 * 1024,
+"schema chunks can continue through the maximum canonical schema size");
 assert.equal(listed.payload.result.tools.find((tool) => tool.name === "disconnect_new_relic").annotations.readOnlyHint, false);
 assert.equal(listed.payload.result.tools.find((tool) => tool.name === "disconnect_new_relic").annotations.destructiveHint, true);
 assert.equal(listed.payload.result.tools.find((tool) => tool.name === "execute_nrql").annotations.readOnlyHint, true);
@@ -564,7 +567,7 @@ class FakeElement {
   children = [];
   listeners = {};
   dataset = {};
-  classList = { add() {}, remove() {} };
+  classList = { add() {}, remove() {}, toggle() {} };
   disabled = false;
   checked = false;
   hidden = false;
@@ -1145,6 +1148,7 @@ globalThis.fetch = originalFetch;
 // repeated backslashes. Verify the complete API response remains within budget.
 const capsDb = new MemoryD1();
 const capsIdentity = "capabilities-size-identity";
+const syntheticSecretName = "NRAK-" + "FAKEFAKEFAKEFAKEFAKE";
 const capsUserId = await siteUserId(new Request("https://example.test/", {
   headers: { "oai-authenticated-user-id": capsIdentity },
 }));
@@ -1159,7 +1163,11 @@ capsDb.connections.set(capsUserId, {
 const capsTools = Array.from({ length: 40 }, (_, index) => ({
   name: "fixture" + index,
   description: "\\".repeat(900),
-  inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  inputSchema: index === 39
+    ? { type: "object", properties: { payload: { type: "string", description: "🙂" + "x".repeat(20000) } }, additionalProperties: false }
+    : index === 38
+      ? { type: "object", properties: { [syntheticSecretName]: { type: "string" } }, additionalProperties: false }
+    : { type: "object", properties: {}, additionalProperties: false },
 }));
 globalThis.fetch = async (_url, options) => {
   const request = JSON.parse(options.body);
@@ -1168,13 +1176,126 @@ globalThis.fetch = async (_url, options) => {
   if (request.method === "tools/list") return Response.json({ jsonrpc: "2.0", id: request.id, result: { tools: capsTools } });
   throw new Error("Unexpected MCP method " + request.method);
 };
-const capsResponse = await worker.fetch(new Request("https://example.test/api/capabilities", {
+const capsResponse = await worker.fetch(new Request("https://example.test/api/capabilities?offset=0&limit=10", {
   headers: { "oai-authenticated-user-id": capsIdentity },
 }), { ...env, DB: capsDb });
 const capsRaw = await capsResponse.text();
 assert.equal(capsResponse.status, 200);
-assert.ok(new TextEncoder().encode(capsRaw).byteLength <= 10000, "API capability response must stay within the serialized byte budget");
-assert.equal(JSON.parse(capsRaw).truncated, true);
+assert.ok(new TextEncoder().encode(capsRaw).byteLength <= 10000, "summary page stays within the API byte budget");
+const capsPage = JSON.parse(capsRaw);
+assert.equal(capsPage.discovered, 40);
+assert.equal(capsPage.items.length, 10);
+assert.equal(capsPage.offset, 0);
+assert.equal(capsPage.nextOffset, 10);
+assert.match(capsPage.snapshot, /^[a-f0-9]{64}$/);
+assert.equal(Object.hasOwn(capsPage.items[0], "inputSchema"), false, "large schemas are not repeated in each catalog page");
+const capsNextResponse = await worker.fetch(new Request("https://example.test/api/capabilities?offset=10&limit=10&snapshot=" + capsPage.snapshot, {
+  headers: { "oai-authenticated-user-id": capsIdentity },
+}), { ...env, DB: capsDb });
+assert.equal(capsNextResponse.status, 200);
+assert.equal((await capsNextResponse.json()).offset, 10);
+const capsDetailResponse = await worker.fetch(new Request("https://example.test/api/capabilities?name=fixture0&schemaHash="
+  + capsPage.items[0].schemaHash + "&snapshot=" + capsPage.snapshot, {
+  headers: { "oai-authenticated-user-id": capsIdentity },
+}), { ...env, DB: capsDb });
+assert.equal(capsDetailResponse.status, 200);
+assert.equal((await capsDetailResponse.json()).tool.name, "fixture0");
+
+const capsEnv = { ...env, DB: capsDb };
+const mcpCapsPage = await call("tools/call", {
+  name: "list_mcp_capabilities", arguments: { offset: 0, limit: 10 },
+}, capsEnv, capsIdentity);
+assert.equal(mcpCapsPage.payload.result.structuredContent.items.length, 10);
+assert.equal(Object.hasOwn(mcpCapsPage.payload.result.structuredContent.items[0], "inputSchema"), false);
+const mcpCapsNext = await call("tools/call", {
+  name: "list_mcp_capabilities", arguments: { offset: 10, limit: 10, snapshot: mcpCapsPage.payload.result.structuredContent.snapshot },
+}, capsEnv, capsIdentity);
+assert.equal(mcpCapsNext.payload.result.structuredContent.offset, 10);
+const mcpHugePage = await call("tools/call", {
+  name: "list_mcp_capabilities", arguments: { offset: 30, limit: 10, snapshot: mcpCapsPage.payload.result.structuredContent.snapshot },
+}, capsEnv, capsIdentity);
+const hugeTool = mcpHugePage.payload.result.structuredContent.items.find(tool => tool.name === "fixture39");
+assert.ok(hugeTool);
+const schemaChunkOne = await call("tools/call", {
+  name: "get_mcp_capability_schema", arguments: {
+    toolName: hugeTool.name, snapshot: mcpHugePage.payload.result.structuredContent.snapshot,
+    schemaHash: hugeTool.schemaHash, offset: 0, limit: 1000,
+  },
+}, capsEnv, capsIdentity);
+const expectedSchemaJson = canonicalJson(capsTools[39].inputSchema);
+assert.equal(schemaChunkOne.payload.result.structuredContent.schemaJsonChunk, expectedSchemaJson.slice(0, 1000));
+assert.equal(schemaChunkOne.payload.result.structuredContent.nextOffset, 1000);
+capsTools[39].inputSchema = {
+  additionalProperties: false,
+  properties: { payload: { description: "🙂" + "x".repeat(20000), type: "string" } },
+  type: "object",
+};
+const schemaChunkTwo = await call("tools/call", {
+  name: "get_mcp_capability_schema", arguments: {
+    toolName: hugeTool.name, snapshot: mcpHugePage.payload.result.structuredContent.snapshot,
+    schemaHash: hugeTool.schemaHash, offset: 1000, limit: 1000,
+  },
+}, capsEnv, capsIdentity);
+assert.equal(schemaChunkTwo.payload.result.structuredContent.offset, 1000);
+assert.equal(schemaChunkTwo.payload.result.structuredContent.schemaJsonChunk, expectedSchemaJson.slice(1000, 2000),
+  "reordering provider object keys between tools/list calls cannot change the canonical chunk stream");
+assert.ok(new TextEncoder().encode(schemaChunkOne.payload.result.structuredContent.schemaJsonChunk).byteLength < 10000,
+  "a single large provider schema is returned in a bounded MCP result chunk");
+const emojiOffset = expectedSchemaJson.indexOf("🙂");
+const emojiChunk = await call("tools/call", {
+  name: "get_mcp_capability_schema", arguments: {
+    toolName: hugeTool.name, snapshot: mcpHugePage.payload.result.structuredContent.snapshot,
+    schemaHash: hugeTool.schemaHash, offset: emojiOffset, limit: 1,
+  },
+}, capsEnv, capsIdentity);
+assert.equal(emojiChunk.payload.result.structuredContent.schemaJsonChunk, "🙂",
+  "a one-code-unit limit still makes forward progress for a surrogate-pair code point");
+assert.equal(emojiChunk.payload.result.structuredContent.nextOffset, emojiOffset + 2);
+const oversizedOffset = await call("tools/call", {
+  name: "get_mcp_capability_schema", arguments: {
+    toolName: hugeTool.name, snapshot: mcpHugePage.payload.result.structuredContent.snapshot,
+    schemaHash: hugeTool.schemaHash, offset: 1_000_001, limit: 1000,
+  },
+}, capsEnv, capsIdentity);
+assert.equal(oversizedOffset.payload.result.isError, true);
+assert.equal(oversizedOffset.payload.result.structuredContent.errorCode, "invalid_catalog_request",
+  "an offset above the old one-million cap reaches the handler's schema-length check");
+const escapeHeavyChunk = await call("tools/call", {
+  name: "get_mcp_capability_schema", arguments: {
+    toolName: hugeTool.name, snapshot: mcpHugePage.payload.result.structuredContent.snapshot,
+    schemaHash: hugeTool.schemaHash, offset: 0, limit: 1500,
+  },
+}, capsEnv, capsIdentity);
+assert.ok(escapeHeavyChunk.payload.result.structuredContent.schemaJsonChunk.length > 0,
+  "escaping-heavy metadata cannot erase the chunk in generic output truncation");
+assert.equal(escapeHeavyChunk.payload.result.structuredContent.nextOffset,
+  escapeHeavyChunk.payload.result.structuredContent.schemaJsonChunk.length);
+assert.ok(new TextEncoder().encode(escapeHeavyChunk.raw).byteLength <= 10000);
+const secretKeyTool = mcpHugePage.payload.result.structuredContent.items.find(tool => tool.name === "fixture38");
+const secretKeySchema = await call("tools/call", {
+  name: "get_mcp_capability_schema", arguments: {
+    toolName: secretKeyTool.name, snapshot: mcpHugePage.payload.result.structuredContent.snapshot,
+    schemaHash: secretKeyTool.schemaHash,
+  },
+}, capsEnv, capsIdentity);
+assert.equal(secretKeySchema.payload.result.isError, true);
+assert.equal(secretKeySchema.payload.result.structuredContent.errorCode, "schema_redacted_for_safety");
+assert.ok(!secretKeySchema.raw.includes(syntheticSecretName),
+  "credential-like object keys are rejected rather than leaked in schema details");
+
+const secretApiResponse = await worker.fetch(new Request("https://example.test/api/capabilities?name=fixture38&schemaHash="
+  + secretKeyTool.schemaHash + "&snapshot=" + mcpHugePage.payload.result.structuredContent.snapshot, {
+  headers: { "oai-authenticated-user-id": capsIdentity },
+}), capsEnv);
+assert.equal(secretApiResponse.status, 422);
+assert.ok(!(await secretApiResponse.clone().text()).includes(syntheticSecretName));
+
+capsTools[0].inputSchema = { type: "object", properties: { changed: { type: "string" } }, additionalProperties: false };
+const changedCapsResponse = await worker.fetch(new Request("https://example.test/api/capabilities?offset=20&limit=10&snapshot=" + capsPage.snapshot, {
+  headers: { "oai-authenticated-user-id": capsIdentity },
+}), { ...env, DB: capsDb });
+assert.equal(changedCapsResponse.status, 409, "pagination fails closed if the upstream schema changes mid-review");
+assert.equal((await changedCapsResponse.json()).errorCode, "catalog_changed");
 globalThis.fetch = originalFetch;
 
 const concurrentDb = new MemoryD1();

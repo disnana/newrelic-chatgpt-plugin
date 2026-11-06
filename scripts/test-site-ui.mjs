@@ -89,7 +89,16 @@ async function mountPage({ capabilityData, proposalData, approvalEnabled = true,
       connectedAt: 1_800_000_000_000, region: "us", selectedAccount: { id: "fake-account", name: "Synthetic" },
     }) };
     if (path === "/api/usage-consent") return { ok: true, status: 200, json: async () => ({ usageConsents: {} }) };
-    if (path === "/api/capabilities") return { ok: true, status: 200, json: async () => capabilityData };
+    if (path.startsWith("/api/capabilities")) {
+      const url = new URL(path, "https://monitor.example.test");
+      const toolName = url.searchParams.get("name");
+      const data = toolName
+        ? capabilityData.details?.[toolName]
+        : capabilityData.pages?.find(page => page.offset === Number(url.searchParams.get("offset") || 0));
+      return data
+        ? { ok: true, status: 200, json: async () => data }
+        : { ok: false, status: 409, json: async () => ({ error: "Catalog changed.", errorCode: "catalog_changed" }) };
+    }
     if (path === "/api/operation-approvals/session") {
       if (!approvalEnabled) return { ok: false, status: 404, json: async () => ({ error: "Operation approvals are unavailable." }) };
       return { ok: true, status: 200, json: async () => ({ csrfToken, sessionExpiresAt: 1_800_000_900_000 }) };
@@ -126,10 +135,22 @@ async function mountPage({ capabilityData, proposalData, approvalEnabled = true,
 }
 
 const catalogPage = await mountPage({
-  capabilityData: { tools: [
-    { name: "execute_nrql", operation: "read", billing: "core_compute", available: false, reason: "usage_consent_required", description: "<script>secret-ish prompt injection</script>" },
-    { name: "unsafe_write", operation: "write", billing: "unknown", available: false, reason: "operation_approval_not_implemented", description: "Provider prose must not be rendered." },
-  ], truncated: false },
+  capabilityData: {
+    pages: [
+      { snapshot: "A".repeat(64).toLowerCase(), discovered: 3, enabled: 0, offset: 0, limit: 2, items: [
+        { name: "execute_nrql", schemaHash: "a".repeat(64), schemaAvailable: true, scope: "account", preview: false, operation: "read", billing: "core_compute", available: false, reason: "usage_consent_required" },
+        { name: "unsafe_write", schemaHash: "b".repeat(64), schemaAvailable: true, scope: "account", preview: true, operation: "write", billing: "unknown", available: false, reason: "operation_approval_not_implemented" },
+      ], nextOffset: 2 },
+      { snapshot: "A".repeat(64).toLowerCase(), discovered: 3, enabled: 0, offset: 2, limit: 2, items: [
+        { name: "another_tool", schemaHash: "c".repeat(64), schemaAvailable: true, scope: "identity", preview: false, operation: "read", billing: "unknown", available: false, reason: "billing_unverified" },
+      ], nextOffset: null },
+    ],
+    details: { execute_nrql: { snapshot: "A".repeat(64).toLowerCase(), tool: {
+      name: "execute_nrql", schemaHash: "a".repeat(64), description: "<script>untrusted provider text</script>",
+      inputSchema: { type: "object", properties: { nrql: { type: "string", maxLength: 1000 } }, required: ["nrql"], additionalProperties: false },
+      outputSchema: null, schemaWasRedacted: false,
+    } } },
+  },
   proposalData: { enabled: true, items: [] },
   csrfCookie: "__Host-nr-gateway-csrf=" + "S".repeat(43),
 });
@@ -138,18 +159,53 @@ assert.equal(catalogButton.disabled, false, "the catalog button is available onl
 assert.deepEqual(catalogPage.calls.map(call => call.path).sort(), ["/api/status", "/api/usage-consent"],
   "page load does not create approval sessions or fetch the live catalog");
 await catalogButton.click();
-assert.equal(catalogPage.calls.filter(call => call.path === "/api/capabilities").length, 1,
+assert.equal(catalogPage.calls.filter(call => call.path.startsWith("/api/capabilities")).length, 1,
   "the official MCP catalog is fetched only after an explicit click");
 assert.ok(catalogPage.calls.every(call => call.path !== "/api/accounts"), "catalog retrieval does not list accounts");
 const catalogText = collectText(catalogPage.elements.get("#capability-list"));
 assert.match(catalogText, /execute_nrql/);
 assert.match(catalogText, /usage_consent_required/);
-assert.doesNotMatch(catalogText, /prompt injection|Provider prose|<script>/,
-  "untrusted provider descriptions are never inserted into the DOM");
-assert.equal(catalogPage.calls.find(call => call.path === "/api/capabilities").options.credentials, "same-origin");
-assert.equal(catalogPage.calls.find(call => call.path === "/api/capabilities").options.headers["x-csrf-token"], "S".repeat(43),
+assert.match(catalogText, /account · 通常/);
+assert.doesNotMatch(catalogText, /untrusted provider text|<script>/,
+  "provider text is not fetched or rendered until the user opens a tool detail");
+const loadMore = catalogPage.elements.get("#load-more-capabilities");
+assert.equal(loadMore.hidden, false);
+await loadMore.click();
+assert.match(collectText(catalogPage.elements.get("#capability-list")), /another_tool/,
+  "the catalog exposes later pages instead of silently truncating entries");
+assert.equal(loadMore.hidden, true);
+const schemaButton = catalogPage.elements.get("#capability-list").children[0].children[2];
+await schemaButton.click();
+const capabilityCalls = catalogPage.calls.filter(call => call.path.startsWith("/api/capabilities"));
+assert.equal(capabilityCalls.length, 3, "one explicit initial page, one requested next page, and one requested schema detail are fetched");
+assert.match(capabilityCalls[1].path, /offset=2/);
+assert.match(capabilityCalls[1].path, /snapshot=/);
+assert.match(capabilityCalls[2].path, /name=execute_nrql/);
+assert.equal(capabilityCalls[0].options.credentials, "same-origin");
+assert.equal(capabilityCalls[0].options.headers["x-csrf-token"], "S".repeat(43),
   "a self-host CSRF cookie is attached as a same-origin request header, never placed in the URL");
-console.log("PASS explicit tools/list-only capability retrieval; no telemetry query and provider descriptions stay hidden");
+assert.equal(capabilityCalls[2].options.headers["x-csrf-token"], "S".repeat(43));
+const schemaPanel = catalogPage.elements.get("#capability-list").children[0].children[3];
+assert.equal(schemaPanel.children[1].textContent, "<script>untrusted provider text</script>",
+  "untrusted provider description is rendered only as plain text on explicit request");
+assert.match(schemaPanel.children[2].textContent, /\"nrql\"/);
+assert.ok(!schemaPanel.children.some(child => child.tagName === "SCRIPT"), "provider text never creates DOM markup");
+console.log("PASS paged tools/list catalog and on-demand schema inspection; no telemetry query");
+
+const failedSchemaPage = await mountPage({
+  capabilityData: { pages: [{ snapshot: "D".repeat(64).toLowerCase(), discovered: 1, enabled: 0, offset: 0, limit: 20,
+    items: [{ name: "stale_schema", schemaHash: "d".repeat(64), schemaAvailable: true, scope: "identity", preview: false,
+      operation: "read", billing: "unknown", available: false, reason: "unreviewed" }], nextOffset: null }] },
+  proposalData: { enabled: true, items: [] },
+});
+await failedSchemaPage.elements.get("#load-capabilities").click();
+const staleRow = failedSchemaPage.elements.get("#capability-list").children[0];
+const staleSchemaButton = staleRow.children[2];
+await staleSchemaButton.click();
+const staleSchemaPanel = staleRow.children[3];
+assert.equal(staleSchemaPanel.hidden, false, "catalog/schema failures remain visible in the selected tool panel");
+assert.match(staleSchemaPanel.children[0].textContent, /Catalog changed/);
+assert.ok(staleSchemaPanel.children[0].classList.contains("error"));
 
 const completionHtml = await readFile(new URL("../worker/oauth-complete.html", import.meta.url), "utf8");
 const completionScript = completionHtml.match(/<script>([\s\S]*?)<\/script>/)?.[1];
