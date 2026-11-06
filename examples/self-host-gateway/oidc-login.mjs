@@ -10,6 +10,37 @@ const CLEANUP_BATCH_SIZE = 100;
 const MAX_PENDING_ATTEMPTS = 1000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 const MAX_REQUEST_TIMEOUT_MS = 30_000;
+const DEFAULT_LOGIN_RATE_WINDOW_MS = 60_000;
+const MAX_LOGIN_RATE_WINDOW_MS = 60 * 60 * 1000;
+const MAX_LOGIN_RATE_BUCKETS_PER_PURGE = 100;
+const LOGIN_RATE_LIMIT_UPSERT_SQL = `
+  WITH current_state AS (
+    SELECT
+      COALESCE((SELECT window_start FROM nr_gateway_oidc_login_rate_limits
+        WHERE bucket_hash = ?), -1) AS client_window,
+      COALESCE((SELECT window_start FROM nr_gateway_oidc_login_rate_limits
+        WHERE bucket_hash = ?), -1) AS global_window,
+      COALESCE((SELECT request_count FROM nr_gateway_oidc_login_rate_limits
+        WHERE bucket_hash = ? AND window_start = ?), 0) AS client_count,
+      COALESCE((SELECT request_count FROM nr_gateway_oidc_login_rate_limits
+        WHERE bucket_hash = ? AND window_start = ?), 0) AS global_count
+  )
+  INSERT INTO nr_gateway_oidc_login_rate_limits (bucket_hash, window_start, request_count, updated_at)
+  SELECT ?, ?, 1, ? FROM current_state
+    WHERE client_window <= ? AND global_window <= ? AND client_count < ? AND global_count < ?
+  UNION ALL
+  SELECT ?, ?, 1, ? FROM current_state
+    WHERE client_window <= ? AND global_window <= ? AND client_count < ? AND global_count < ?
+  ON CONFLICT(bucket_hash) DO UPDATE SET
+    request_count = CASE
+      WHEN nr_gateway_oidc_login_rate_limits.window_start = excluded.window_start
+      THEN nr_gateway_oidc_login_rate_limits.request_count + 1
+      ELSE 1
+    END,
+    window_start = excluded.window_start,
+    updated_at = excluded.updated_at
+  RETURNING bucket_hash
+`;
 
 function plain(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -95,6 +126,65 @@ async function sha256(value) {
 export async function mapOidcSubject(issuer, subject) {
   if (!safeHttpsUrl(issuer) || !validSecret(subject, 255)) throw new TypeError("OIDC issuer and subject are required.");
   return "oidc:" + await sha256("newrelic-chatgpt-oidc-subject\0" + issuer + "\0" + subject);
+}
+
+/**
+ * Create an atomic D1 fixed-window admission limiter for OIDC login starts.
+ * `trustedClientKeyFromRequest` must return a 32-byte HMAC-SHA-256 digest
+ * (base64url or lowercase hex) derived from a trusted ingress identity. Never
+ * return raw IP addresses or trust caller-supplied forwarding headers. This
+ * module stores only a second hash of that opaque key, plus per-window counters.
+ */
+export function createD1OidcLoginStartRateLimiter({
+  db,
+  trustedClientKeyFromRequest,
+  now = () => Date.now(),
+  windowMs = DEFAULT_LOGIN_RATE_WINDOW_MS,
+  maxPerClient = 10,
+  maxGlobal = 500,
+}) {
+  if (!db || typeof db.prepare !== "function" || typeof trustedClientKeyFromRequest !== "function"
+    || typeof now !== "function" || !Number.isSafeInteger(windowMs)
+    || windowMs < 1000 || windowMs > MAX_LOGIN_RATE_WINDOW_MS
+    || !Number.isSafeInteger(maxPerClient) || maxPerClient < 1 || maxPerClient > 1000
+    || !Number.isSafeInteger(maxGlobal) || maxGlobal < 1 || maxGlobal > 100_000) {
+    throw new TypeError("OIDC start limiting requires private D1, a trusted client-key adapter, and bounded limits.");
+  }
+
+  async function admit(request) {
+    const opaqueClientKey = await trustedClientKeyFromRequest(request);
+    if (typeof opaqueClientKey !== "string"
+      || !/^(?:[A-Za-z0-9_-]{43}|[a-f0-9]{64})$/.test(opaqueClientKey)) {
+      throw new TypeError("Trusted OIDC client identity is unavailable.");
+    }
+    const currentTime = now();
+    if (!Number.isSafeInteger(currentTime) || currentTime < 0) {
+      throw new TypeError("OIDC rate-limit clock is invalid.");
+    }
+    const windowStart = Math.floor(currentTime / windowMs) * windowMs;
+    const clientHash = await sha256("newrelic-chatgpt-oidc-rate-client\0" + opaqueClientKey);
+    const globalHash = await sha256("newrelic-chatgpt-oidc-rate-global\0v1");
+    const result = await db.prepare(LOGIN_RATE_LIMIT_UPSERT_SQL).bind(clientHash, globalHash,
+      clientHash, windowStart, globalHash, windowStart,
+      clientHash, windowStart, currentTime, windowStart, windowStart, maxPerClient, maxGlobal,
+      globalHash, windowStart, currentTime, windowStart, windowStart, maxPerClient, maxGlobal).run();
+    const changes = Number(result?.meta?.changes || 0);
+    if (changes !== 2) return false;
+    return true;
+  }
+
+  async function purgeExpired({ now: cleanupNow = now() } = {}) {
+    if (!Number.isSafeInteger(cleanupNow) || cleanupNow < 0) {
+      throw new TypeError("OIDC rate-limit cleanup clock is invalid.");
+    }
+    const result = await db.prepare(
+      "DELETE FROM nr_gateway_oidc_login_rate_limits WHERE bucket_hash IN (SELECT bucket_hash FROM nr_gateway_oidc_login_rate_limits WHERE window_start + ? <= ? ORDER BY window_start ASC, bucket_hash ASC LIMIT ?)",
+    ).bind(windowMs, cleanupNow, MAX_LOGIN_RATE_BUCKETS_PER_PURGE).run();
+    return Number(result?.meta?.changes || 0);
+  }
+
+  Object.defineProperty(admit, "purgeExpired", { value: purgeExpired });
+  return Object.freeze({ admit, purgeExpired });
 }
 
 /** Import a 32-byte base64url AES-GCM key stored in the gateway's secret manager. */
@@ -614,7 +704,11 @@ export function createOidcBrowserLogin({
     const result = await db.prepare(
       "DELETE FROM nr_gateway_oidc_login_attempts WHERE state_hash IN (SELECT state_hash FROM nr_gateway_oidc_login_attempts WHERE consumed_at IS NOT NULL OR expires_at <= ? ORDER BY COALESCE(consumed_at, expires_at) ASC LIMIT ?)",
     ).bind(cleanupNow, CLEANUP_BATCH_SIZE).run();
-    return Number(result?.meta?.changes || 0);
+    const attemptCount = Number(result?.meta?.changes || 0);
+    const cleanupRateLimits = admitLoginStart.purgeExpired;
+    const rateLimitCount = typeof cleanupRateLimits === "function"
+      ? await cleanupRateLimits({ now: cleanupNow }) : 0;
+    return attemptCount + rateLimitCount;
   }
 
   return Object.freeze({ fetch: fetchHandler, purgeExpiredAttempts });

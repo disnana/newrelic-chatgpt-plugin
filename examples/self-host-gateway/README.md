@@ -6,9 +6,11 @@ The reference can authenticate browser requests through its optional OIDC adapte
 
 ## Optional generic OIDC browser login
 
-`oidc-login.mjs` implements an opt-in OpenID Connect Authorization Code flow for browser sessions. It is an example adapter, not a production identity product. It uses fixed operator-supplied HTTPS issuer, authorization, token, and JWKS URLs; it does not perform dynamic discovery. Every endpoint origin must appear in the explicit operator allowlist. The client secret and a non-extractable 256-bit AES-GCM key for temporary flow state must come from the gateway secret manager. Do not use the New Relic token-encryption key for OIDC state. Construction also requires a trusted `admitLoginStart(request)` adapter; without it the login adapter fails closed.
+`oidc-login.mjs` implements an opt-in OpenID Connect Authorization Code flow for browser sessions. It is an example adapter, not a production identity product. It uses fixed operator-supplied HTTPS issuer, authorization, token, and JWKS URLs; it does not perform dynamic discovery. Every endpoint origin must appear in the explicit operator allowlist. The client secret and a non-extractable 256-bit AES-GCM key for temporary flow state must come from the gateway secret manager. Do not use the New Relic token-encryption key for OIDC state. Construction also requires an admission adapter; use the included D1 limiter and supply only a trusted ingress identity extractor. Without admission, login construction fails closed.
 
-Apply `0002_oidc_login_attempts.sql` only to the private gateway `AUTH_DB`, after `0001_browser_sessions.sql`. The table stores a one-time state hash and an encrypted PKCE verifier/nonce. A successful callback consumes the state with a conditional update and clears the encrypted verifier before calling the token endpoint. Stale rows may be removed with `purgeExpiredAttempts()` in bounded batches of 100; login start also attempts one bounded cleanup. New pending flows are capped at 1,000. No cleanup schedule is configured by this example. The cap is not an abuse control: the required admission adapter must enforce atomic per-client and global rate limits before state is created, and fail closed on its own errors. It must derive client identity only from a trusted ingress that strips caller-supplied forwarding headers; never trust raw `X-Forwarded-For` or other client-controlled identifiers. This generic module cannot identify a trusted remote client by itself.
+Apply `0001_browser_sessions.sql`, `0002_oidc_login_attempts.sql`, and `0003_oidc_login_rate_limits.sql` only to the private gateway `AUTH_DB`, in that order. These are separate from the New Relic app database. The OIDC table stores a one-time state hash and an encrypted PKCE verifier/nonce; the limiter table stores per-client and global fixed-window counters, not IP addresses. A successful callback consumes state with a conditional update and clears the encrypted verifier before calling the token endpoint. The included `createD1OidcLoginStartRateLimiter` atomically enforces both limits before creating state (defaults: 10 starts/client and 500 starts globally per 60-second window). It rejects delayed writes from an older window so they cannot reset a newer quota. The operator must still supply `trustedClientKeyFromRequest`: it must derive a stable keyed HMAC-SHA-256 digest from an identity attested by a trusted ingress that strips caller-supplied forwarding headers. The helper accepts only a 32-byte digest in base64url or lowercase hex form, hashes it again before persistence, and fails closed if the callback is missing, invalid, or throws. Never pass raw IP addresses or trust raw `X-Forwarded-For` or other client-controlled identifiers. Rejections return 429; limiter errors return 503 before OIDC state is created. The generic module cannot identify a trusted remote client by itself.
+
+Expired OIDC attempts and rate-limit buckets are cleaned opportunistically in batches of at most 100 when a login starts; no scheduled cleanup is configured. Pass the limiter's `admit` function directly to preserve its attached cleanup hook. The pending-flow cap remains a separate last-resort resource bound, not an abuse control.
 
 The flow requires top-level navigation, sends `scope=openid`, uses S256 PKCE, binds the callback to both a Secure/HttpOnly/Lax state cookie and a D1 single-use state, and validates the ID Token's RS256 signature against the configured JWKS URI, exact issuer, audience/authorized party, expiry/issued-at, nonce, and stable subject. Token and JWKS requests do not follow redirects, each has a 10-second default timeout (operator-configurable up to 30 seconds), and each response is limited to 64 KiB. Provider errors are not reflected to the browser. The access token and refresh token in the token response are ignored and not persisted. Only an allowlisted subject hash can create a browser session. The gateway's `allowedSubjects` and Worker's `NEW_RELIC_AUTH_ALLOWED_SUBJECTS` must contain the same mapped subject. `mapOidcSubject(issuer, sub)` computes the stable `oidc:<sha256>` mapping for a trusted operator enrollment workflow; the adapter does not disclose unknown subjects or auto-enroll users. Because the callback uses query response mode, configure gateway/proxy logs to redact `/auth/callback` query strings and never log cookies, authorization codes, ID Tokens, or client credentials.
 
@@ -16,7 +18,15 @@ Minimal wiring, with all values read from the operator's own secret/configuratio
 
 ```js
 import { createD1BrowserSessionAdapter } from "./browser-session.mjs";
-import { createOidcBrowserLogin, importOidcStateEncryptionKey } from "./oidc-login.mjs";
+import { createD1OidcLoginStartRateLimiter, createOidcBrowserLogin, importOidcStateEncryptionKey } from "./oidc-login.mjs";
+
+// Implement this operator adapter using the platform's trusted ingress identity.
+// Do not read a caller-controlled X-Forwarded-For value.
+const trustedClientKeyFromRequest = request => trustedIngress.clientHmacKey(request);
+const loginStartLimiter = createD1OidcLoginStartRateLimiter({
+  db: env.AUTH_DB,
+  trustedClientKeyFromRequest,
+});
 
 const browserSessions = createD1BrowserSessionAdapter({
   db: env.AUTH_DB,
@@ -35,9 +45,8 @@ const browserLogin = createOidcBrowserLogin({
   clientSecret: env.OIDC_CLIENT_SECRET,
   tokenEndpointAuthMethod: env.OIDC_CLIENT_AUTH_METHOD || "client_secret_post",
   allowedSubjects: JSON.parse(env.OIDC_ALLOWED_SUBJECT_HASHES),
-  // Operator-provided rate limiter backed by a trusted ingress identity.
-  // It must atomically enforce per-client and global limits, and fail closed.
-  admitLoginStart: request => env.LOGIN_ADMISSION.admit(request),
+  // Pass directly to preserve the built-in bounded cleanup hook.
+  admitLoginStart: loginStartLimiter.admit,
   stateEncryptionKey: await importOidcStateEncryptionKey(env.OIDC_STATE_KEY_BASE64URL),
 });
 const gateway = createSelfHostGateway({

@@ -4,7 +4,7 @@ import { DatabaseSync } from "node:sqlite";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { resolve } from "node:path";
-import { createOidcBrowserLogin, importOidcStateEncryptionKey, mapOidcSubject } from "../examples/self-host-gateway/oidc-login.mjs";
+import { createD1OidcLoginStartRateLimiter, createOidcBrowserLogin, importOidcStateEncryptionKey, mapOidcSubject } from "../examples/self-host-gateway/oidc-login.mjs";
 import { createSelfHostGateway } from "../examples/self-host-gateway/gateway.mjs";
 import { createD1BrowserSessionAdapter } from "../examples/self-host-gateway/browser-session.mjs";
 
@@ -25,13 +25,31 @@ const randomBytes = length => new Uint8Array(length).fill(randomCounter++);
 const sqlite = new DatabaseSync(":memory:");
 sqlite.exec(await readFile(new URL("../examples/self-host-gateway/0001_browser_sessions.sql", import.meta.url), "utf8"));
 sqlite.exec(await readFile(new URL("../examples/self-host-gateway/0002_oidc_login_attempts.sql", import.meta.url), "utf8"));
+sqlite.exec(await readFile(new URL("../examples/self-host-gateway/0003_oidc_login_rate_limits.sql", import.meta.url), "utf8"));
+let pendingRateLimitPause = null;
+function pauseNextRateLimitWrite() {
+  let markStarted;
+  let release;
+  const started = new Promise(resolve => { markStarted = resolve; });
+  const paused = new Promise(resolve => { release = resolve; });
+  pendingRateLimitPause = { markStarted, paused };
+  return { started, release };
+}
 const db = {
   prepare(query) {
     const statement = sqlite.prepare(query);
     let values = [];
     return {
       bind(...args) { values = args; return this; },
-      async run() { return { meta: { changes: Number(statement.run(...values).changes) } }; },
+      async run() {
+        if (query.includes("INSERT INTO nr_gateway_oidc_login_rate_limits") && pendingRateLimitPause) {
+          const gate = pendingRateLimitPause;
+          pendingRateLimitPause = null;
+          gate.markStarted();
+          await gate.paused;
+        }
+        return { meta: { changes: Number(statement.run(...values).changes) } };
+      },
       async first() { return statement.get(...values) || null; },
     };
   },
@@ -121,32 +139,115 @@ await assert.rejects(async () => createOidcBrowserLogin({
   stateEncryptionKey: stateKey, fetchImpl, now: () => now, randomBytes,
 }), /explicit subject allowlist/);
 
-const admissionCounts = new Map();
+let limiterNow = now;
+const syntheticIngressHmacKey = await crypto.subtle.importKey(
+  "raw", Buffer.from("synthetic-only-ingress-hmac-key"), { name: "HMAC", hash: "SHA-256" }, false, ["sign"],
+);
+const syntheticClientKeyFromRequest = async request => {
+  const client = request.headers.get("x-synthetic-client");
+  if (!client) return null;
+  return Buffer.from(await crypto.subtle.sign("HMAC", syntheticIngressHmacKey, new TextEncoder().encode(client)))
+    .toString("base64url");
+};
+const loginStartLimiter = createD1OidcLoginStartRateLimiter({
+  db,
+  trustedClientKeyFromRequest: syntheticClientKeyFromRequest,
+  now: () => limiterNow,
+  windowMs: 60_000,
+  maxPerClient: 2,
+  maxGlobal: 3,
+});
 const limitedLogin = createOidcBrowserLogin({
   db, sessions, externalOrigin: origin, issuer, clientId, clientSecret,
   authorizationEndpoint, tokenEndpoint, jwksUri, allowedEndpointOrigins: ["https://auth.example.test"],
-  allowedSubjects: [expectedSubject], stateEncryptionKey: stateKey,
-  admitLoginStart: async request => {
-    const client = request.headers.get("x-synthetic-client");
-    const count = (admissionCounts.get(client) || 0) + 1;
-    admissionCounts.set(client, count);
-    return client !== "synthetic-abuser" || count <= 1;
-  },
-  fetchImpl, now: () => liveNow, randomBytes,
+  allowedSubjects: [expectedSubject], stateEncryptionKey: stateKey, admitLoginStart: loginStartLimiter.admit,
+  fetchImpl, now: () => limiterNow, randomBytes,
 });
 const attemptsBeforeAdmission = sqlite.prepare("SELECT COUNT(*) AS count FROM nr_gateway_oidc_login_attempts").get().count;
 const limitedStart = request => limitedLogin.fetch(new Request(origin + "/auth/start", {
   headers: { origin, "sec-fetch-site": "same-origin", "sec-fetch-mode": "navigate", "sec-fetch-dest": "document",
     "x-synthetic-client": request },
 }));
-assert.equal((await limitedStart("synthetic-abuser")).status, 302);
-const deniedStart = await limitedStart("synthetic-abuser");
-assert.equal(deniedStart.status, 429, "the trusted admission adapter can throttle repeated login starts");
-assert.equal(deniedStart.headers.get("set-cookie"), null, "a rejected login start does not create state cookies");
-assert.equal((await limitedStart("synthetic-legitimate-user")).status, 302,
-  "one client's limit does not block a separately admitted client");
+assert.equal((await limitedStart("synthetic-client-a")).status, 302);
+assert.equal((await limitedStart("synthetic-client-a")).status, 302);
+assert.equal((await limitedStart("synthetic-client-b")).status, 302,
+  "a separate client may use remaining global capacity");
+const clientLimit = await limitedStart("synthetic-client-a");
+assert.equal(clientLimit.status, 429, "per-client window limit rejects an over-limit start");
+const globalLimit = await limitedStart("synthetic-client-b");
+assert.equal(globalLimit.status, 429, "global window limit rejects starts after shared capacity is used");
+assert.equal(clientLimit.headers.get("set-cookie"), null, "a rejected login start does not create state cookies");
+assert.equal(globalLimit.headers.get("set-cookie"), null, "a rejected login start does not create state cookies");
+limiterNow += 60_000;
+assert.equal((await limitedStart("synthetic-client-a")).status, 302, "client and global counters reset at the next fixed window");
+assert.equal((await limitedStart("synthetic-client-b")).status, 302);
+limiterNow += 60_000;
+const concurrentStarts = await Promise.all(Array.from({ length: 8 }, () => limitedStart("synthetic-client-c")));
+assert.equal(concurrentStarts.filter(response => response.status === 302).length, 2,
+  "the atomic limiter statement respects the per-client limit under overlapping synthetic requests");
+assert.equal(concurrentStarts.filter(response => response.status === 429).length, 6);
+const rateRowsBeforePurge = sqlite.prepare("SELECT COUNT(*) AS count FROM nr_gateway_oidc_login_rate_limits").get().count;
+assert.ok(rateRowsBeforePurge >= 2);
+assert.ok(await loginStartLimiter.purgeExpired({ now: now + 3 * 60_000 }) >= 2,
+  "expired per-client and global rate-limit buckets are removed in a bounded batch");
+limiterNow = now + 4 * 60_000;
+const delayedWindowLimiter = createD1OidcLoginStartRateLimiter({
+  db, trustedClientKeyFromRequest: syntheticClientKeyFromRequest,
+  now: () => limiterNow, windowMs: 60_000, maxPerClient: 1, maxGlobal: 10,
+});
+const delayedRateRequest = new Request(origin, { headers: { "x-synthetic-client": "synthetic-delayed-window-client" } });
+const pause = pauseNextRateLimitWrite();
+const delayedPriorWindowAdmission = delayedWindowLimiter.admit(delayedRateRequest);
+await pause.started;
+limiterNow += 60_000;
+assert.equal(await delayedWindowLimiter.admit(delayedRateRequest), true,
+  "the current window admits its first request while an older SQL write is delayed");
+assert.equal(await delayedWindowLimiter.admit(delayedRateRequest), false,
+  "the current window limit is consumed before the delayed older write resumes");
+pause.release();
+assert.equal(await delayedPriorWindowAdmission, false,
+  "a delayed request from an older window is rejected instead of rewinding counters");
+assert.equal(await delayedWindowLimiter.admit(delayedRateRequest), false,
+  "the delayed older request cannot reset the current per-client quota");
+
+limiterNow = now + 6 * 60_000;
+const globalWindowLimiter = createD1OidcLoginStartRateLimiter({
+  db, trustedClientKeyFromRequest: syntheticClientKeyFromRequest,
+  now: () => limiterNow, windowMs: 60_000, maxPerClient: 10, maxGlobal: 1,
+});
+const staleClientRequest = new Request(origin, { headers: { "x-synthetic-client": "synthetic-stale-global-client" } });
+const currentClientRequest = new Request(origin, { headers: { "x-synthetic-client": "synthetic-current-global-client" } });
+const globalPause = pauseNextRateLimitWrite();
+const delayedGlobalAdmission = globalWindowLimiter.admit(staleClientRequest);
+await globalPause.started;
+limiterNow += 60_000;
+assert.equal(await globalWindowLimiter.admit(currentClientRequest), true,
+  "a new client can consume the new window's shared global capacity");
+globalPause.release();
+assert.equal(await delayedGlobalAdmission, false,
+  "a delayed old-window request from a different client cannot rewind the global bucket");
+assert.equal(await globalWindowLimiter.admit(currentClientRequest), false,
+  "the stale different-client request does not reset shared global capacity");
+
+const brokenLimiter = createD1OidcLoginStartRateLimiter({
+  db, trustedClientKeyFromRequest: async () => null, now: () => limiterNow,
+});
+const brokenLogin = createOidcBrowserLogin({
+  db, sessions, externalOrigin: origin, issuer, clientId, clientSecret,
+  authorizationEndpoint, tokenEndpoint, jwksUri, allowedEndpointOrigins: ["https://auth.example.test"],
+  allowedSubjects: [expectedSubject], stateEncryptionKey: stateKey, admitLoginStart: brokenLimiter.admit,
+  fetchImpl, now: () => liveNow, randomBytes,
+});
+const attemptsBeforeBrokenAdmission = sqlite.prepare("SELECT COUNT(*) AS count FROM nr_gateway_oidc_login_attempts").get().count;
+const identityUnavailable = await brokenLogin.fetch(new Request(origin + "/auth/start", {
+  headers: { origin, "sec-fetch-site": "same-origin", "sec-fetch-mode": "navigate", "sec-fetch-dest": "document" },
+}));
+assert.equal(identityUnavailable.status, 503, "missing trusted ingress identity fails closed");
 assert.equal(sqlite.prepare("SELECT COUNT(*) AS count FROM nr_gateway_oidc_login_attempts").get().count,
-  attemptsBeforeAdmission + 2, "denied login starts create no durable OIDC state");
+  attemptsBeforeBrokenAdmission, "failed admission creates no OIDC state");
+assert.equal(sqlite.prepare("SELECT COUNT(*) AS count FROM nr_gateway_oidc_login_attempts").get().count,
+  attemptsBeforeAdmission + 2 + 1 + 2 + 2,
+  "accepted starts create state; rejected or missing identities do not");
 
 const gatewayKeys = await crypto.subtle.generateKey({
   name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: Uint8Array.of(1, 0, 1), hash: "SHA-256",
@@ -444,6 +545,6 @@ assert.equal(timeoutCallback.status, 502, "a stalled token endpoint is aborted w
 assert.equal(timeoutCallback.headers.getSetCookie()[0], "__Host-nr-oidc-state=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Lax");
 const beforeCleanup = sqlite.prepare("SELECT COUNT(*) AS count FROM nr_gateway_oidc_login_attempts").get().count;
 assert.ok(beforeCleanup > 0);
-assert.equal(await browserLogin.purgeExpiredAttempts({ now: now + 11 * 60 * 1000 }), beforeCleanup);
+assert.equal(await browserLogin.purgeExpiredAttempts({ now: now + 14 * 60 * 1000 }), beforeCleanup);
 assert.equal(sqlite.prepare("SELECT COUNT(*) AS count FROM nr_gateway_oidc_login_attempts").get().count, 0);
 console.log("Self-host OIDC login tests passed: PKCE, nonce, signature/issuer/audience checks, D1 single-use state, allowlist, browser session issuance, and gateway isolation; provider calls: mock only");
