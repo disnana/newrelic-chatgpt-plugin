@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { webcrypto } from "node:crypto";
-import { encryptSecret, decryptSecret, getConnectionStatus, withNewRelicSession, callNewRelicRawTool } from "../worker/newrelic.js";
+import { encryptSecret, decryptSecret, getConnectionStatus, withNewRelicSession, callNewRelicRawTool, callNewRelicTool } from "../worker/newrelic.js";
 globalThis.crypto ||= webcrypto;
 class MemoryD1 {
   states = new Map();
@@ -152,6 +152,53 @@ await test("CAS conflict never overwrites replacement or demands reauth",async()
 await test("401 refreshes once and rebuilds session",async()=>{
  const env=await fixture(Date.now()+120000);let refreshes=0,initializes=0;globalThis.fetch=async(url,o)=>{if(url.includes("oauth2/token")){refreshes++;return validTokenResponse()};const p=JSON.parse(o.body);if(p.method==="initialize"&&++initializes===1)return new Response(null,{status:401});return mcpResponse(o)};
  assert.equal(await withNewRelicSession(env,user,()=>"read-ok"),"read-ok");assert.equal(refreshes,1);assert.equal(initializes,2);
+});
+await test("second 401 after refresh requires reconnect",async()=>{
+ const env=await fixture(Date.now()+120000);let refreshes=0,initializes=0;
+ globalThis.fetch=async(url,o)=>{
+  if(String(url).includes("oauth2/token")){refreshes++;return validTokenResponse()}
+  const p=JSON.parse(o.body);
+  if(p.method==="initialize"){initializes++;return new Response(null,{status:401})}
+  throw new Error("unexpected method");
+ };
+ await assert.rejects(()=>withNewRelicSession(env,user,()=>"unreachable"),e=>e.code==="access_token_rejected_after_refresh"&&e.requiresReauthentication===true&&e.refreshable===false);
+ assert.equal(refreshes,1);assert.equal(initializes,2);
+});
+await test("potentially metered legacy reads are disabled by default",async()=>{
+ const env=await fixture(Date.now()+120000);let toolCalls=0;
+ globalThis.fetch=async(_url,o)=>{
+  const p=JSON.parse(o.body);
+  if(p.method==="notifications/initialized")return new Response(null,{status:202});
+  if(p.method==="initialize")return Response.json({jsonrpc:"2.0",id:p.id,result:{}});
+  if(p.method==="tools/list")return Response.json({jsonrpc:"2.0",id:p.id,result:{tools:[{name:"list_available_new_relic_accounts",inputSchema:{type:"object",properties:{},additionalProperties:false}}]}});
+  if(p.method==="tools/call"){toolCalls++;return Response.json({jsonrpc:"2.0",id:p.id,result:{content:[{type:"text",text:"accounts"}]}})}
+  throw new Error("unexpected method");
+ };
+ await assert.rejects(()=>withNewRelicSession(env,user,session=>callNewRelicTool(session,"list_available_new_relic_accounts",{})),e=>e.code==="metered_reads_disabled");
+ assert.equal(toolCalls,0,"a disabled read must not reach tools/call");
+});
+await test("metered legacy reads run only after explicit opt-in",async()=>{
+ const env={...(await fixture(Date.now()+120000)),NEW_RELIC_ENABLE_METERED_READS:"true"};let toolCalls=0;
+ globalThis.fetch=async(_url,o)=>{
+  const p=JSON.parse(o.body);
+  if(p.method==="notifications/initialized")return new Response(null,{status:202});
+  if(p.method==="initialize")return Response.json({jsonrpc:"2.0",id:p.id,result:{}});
+  if(p.method==="tools/list")return Response.json({jsonrpc:"2.0",id:p.id,result:{tools:[{name:"list_available_new_relic_accounts",inputSchema:{type:"object",properties:{},additionalProperties:false}}]}});
+  if(p.method==="tools/call"){toolCalls++;return Response.json({jsonrpc:"2.0",id:p.id,result:{content:[{type:"text",text:"accounts"}]}})}
+  throw new Error("unexpected method");
+ };
+ await withNewRelicSession(env,user,session=>callNewRelicTool(session,"list_available_new_relic_accounts",{}));
+ assert.equal(toolCalls,1);
+});
+await test("legacy AI tools require Advanced Compute opt-in",async()=>{
+ const env={...(await fixture(Date.now()+120000)),NEW_RELIC_ENABLE_METERED_READS:"true"};
+ globalThis.fetch=async(_url,o)=>mcpResponse(o,[{name:"analyze_deployment_impact",inputSchema:{type:"object",properties:{},additionalProperties:false}}]);
+ await assert.rejects(()=>withNewRelicSession(env,user,s=>callNewRelicTool(s,"analyze_deployment_impact",{})),e=>e.code==="advanced_compute_opt_in_required");
+});
+await test("unclassified legacy tools remain blocked after Core opt-in",async()=>{
+ const env={...(await fixture(Date.now()+120000)),NEW_RELIC_ENABLE_METERED_READS:"true"};
+ globalThis.fetch=async(_url,o)=>mcpResponse(o,[{name:"future_unknown_tool",inputSchema:{type:"object",properties:{},additionalProperties:false}}]);
+ await assert.rejects(()=>withNewRelicSession(env,user,s=>callNewRelicTool(s,"future_unknown_tool",{})),e=>e.code==="legacy_tool_billing_unverified");
 });
 await test("403 does not refresh and retry request",async()=>{
  const env=await fixture(Date.now()+120000);let calls=0;globalThis.fetch=async()=>{calls++;return new Response(null,{status:403})};

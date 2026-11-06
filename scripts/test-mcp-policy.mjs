@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { webcrypto } from 'node:crypto';
-import { schemaFingerprint, capabilityCatalog, authorizeReadTool, validateSchema, validateToolResult, readPolicies } from '../worker/mcp-policy.js';
+import { canonicalJson, schemaFingerprint, capabilityCatalog, authorizeReadTool, validateSchema, validateToolResult, readPolicies } from '../worker/mcp-policy.js';
 globalThis.crypto ||= webcrypto;
 const tool={name:'example_read',inputSchema:{type:'object',properties:{accountId:{type:'integer'},query:{type:'string',maxLength:100}},required:['accountId'],additionalProperties:false}};
 const hash=await schemaFingerprint(tool);
-const policy={schemaHash:hash,operation:'read',billing:'free',preview:false,scope:'account',accountFields:['accountId']};
-const env={NEW_RELIC_MCP_POLICIES:JSON.stringify({example_read:policy})};
+const policy={schemaHash:hash,operation:'read',billing:'core_compute',preview:false,scope:'account',accountFields:['accountId']};
+const env={NEW_RELIC_MCP_POLICIES:JSON.stringify({example_read:policy}),NEW_RELIC_ENABLE_METERED_READS:'true'};
 assert.equal((await capabilityCatalog([tool],{}))[0].reason,'policy_not_reviewed');
 assert.equal((await capabilityCatalog([tool],env))[0].available,true);
 await authorizeReadTool({tools:[tool]},env,tool.name,{accountId:1},'1',['1']);
@@ -17,10 +17,27 @@ await assert.rejects(authorizeReadTool({tools:[tool]},env,'example-read',{accoun
 await assert.rejects(capabilityCatalog([tool,tool],env));
 const changed={...tool,inputSchema:{...tool.inputSchema,additionalProperties:true}};
 assert.equal((await capabilityCatalog([changed],env))[0].reason,'schema_changed_review_required');
-for(const [field,value,reason] of [['operation','write','operation_approval_not_implemented'],['operation','destructive','operation_approval_not_implemented'],['billing','billable','billable_disabled'],['billing','unknown','billing_unverified'],['preview',true,'preview_opt_in_required']]) {
- const blocked={NEW_RELIC_MCP_POLICIES:JSON.stringify({example_read:{...policy,[field]:value}})};
+for(const [field,value,reason] of [['operation','write','operation_approval_not_implemented'],['operation','destructive','operation_approval_not_implemented'],['billing','unknown','billing_unverified'],['preview',true,'preview_opt_in_required']]) {
+ const blocked={NEW_RELIC_MCP_POLICIES:JSON.stringify({example_read:{...policy,[field]:value}}),...(field==='preview'?{NEW_RELIC_ENABLE_METERED_READS:'true'}:{})};
  assert.equal((await capabilityCatalog([tool],blocked))[0].reason,reason);
  await assert.rejects(authorizeReadTool({tools:[tool]},blocked,tool.name,{accountId:1},'1',['1']));
+}
+for(const [blocked,reason] of [
+ [{NEW_RELIC_MCP_POLICIES:JSON.stringify({example_read:{...policy,billing:'core_compute'}})},'metered_reads_disabled'],
+ [{NEW_RELIC_MCP_POLICIES:JSON.stringify({example_read:{...policy,billing:'advanced_compute'}})},'advanced_compute_opt_in_required'],
+]) {
+ assert.equal((await capabilityCatalog([tool],blocked))[0].reason,reason);
+ await assert.rejects(authorizeReadTool({tools:[tool]},blocked,tool.name,{accountId:1},'1',['1']));
+}
+const advancedEnabled={
+ NEW_RELIC_MCP_POLICIES:JSON.stringify({example_read:{...policy,billing:'advanced_compute'}}),
+ NEW_RELIC_ENABLE_ADVANCED_COMPUTE:'true',
+};
+assert.equal((await capabilityCatalog([tool],advancedEnabled))[0].available,true);
+await authorizeReadTool({tools:[tool]},advancedEnabled,tool.name,{accountId:1},'1',['1']);
+assert.throws(()=>readPolicies({NEW_RELIC_MCP_POLICIES:JSON.stringify({example_read:{...policy,billing:'free'}})}));
+for(const [field,value] of [['properties',null],['required',null],['anyOf',null],['oneOf',false],['allOf',null],['items',null]]) {
+ assert.throws(()=>validateSchema({}, {type:'object',[field]:value}), `malformed ${field} schema should fail closed`);
 }
 assert.throws(()=>validateSchema('x',{type:'string',pattern:'.*'}));
 assert.throws(()=>validateSchema(1,{oneOf:[{type:'integer'},{type:'number'}]}));
@@ -33,3 +50,8 @@ console.log('MCP policy tests passed: fail-closed catalog, schema pinning, argum
 for(const schema of [{type:'string',maxLength:'oops'},{minimum:NaN},{uniqueItems:1},{enum:'a'}]) assert.throws(()=>validateSchema('a',schema));
 assert.notEqual(await schemaFingerprint({...tool,annotations:{readOnlyHint:false}}),hash);
 assert.deepEqual(validateToolResult({content:[{type:'text',text:'ok',url:'https://evil.example'}],_meta:{secret:'opaque'}},tool),{content:[{type:'text',text:'ok'}]});
+let deeplyNested={marker:true};
+for(let index=0;index<5000;index++) deeplyNested={nested:deeplyNested};
+await assert.rejects(()=>schemaFingerprint({...tool,_meta:deeplyNested}),error=>error.code==='unsupported_schema');
+assert.equal((await capabilityCatalog([{...tool,_meta:deeplyNested}],env))[0].reason,'unsupported_schema');
+assert.throws(()=>canonicalJson(deeplyNested),error=>error.code==='unsupported_schema');

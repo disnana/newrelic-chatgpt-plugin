@@ -9,12 +9,14 @@ const workerPath = resolve(root, "dist/server/index.js");
 const worker = (await import(pathToFileURL(workerPath).href + "?test=" + Date.now())).default;
 const { normalizeNrql, buildComparisonNrql, validateLogFilter, validateLogWindow, filterMetricNames } =
   await import(pathToFileURL(resolve(root, "worker/nrql.js")).href + "?test=" + Date.now());
-const { beginNewRelicAuthorization, decryptSecret, encryptSecret, siteUserId, getConnectionStatus, withNewRelicSession, findNewRelicTool } =
+const { schemaFingerprint } = await import(pathToFileURL(resolve(root, "worker/mcp-policy.js")).href + "?test=" + Date.now());
+const { beginNewRelicAuthorization, completePastedNewRelicAuthorization, disconnectNewRelic, decryptSecret, encryptSecret, siteUserId, getConnectionStatus, withNewRelicSession, findNewRelicTool } =
   await import(pathToFileURL(resolve(root, "worker/newrelic.js")).href + "?test=" + Date.now());
 
 class MemoryD1 {
   states = new Map();
   connections = new Map();
+  preferences = new Map();
   rates = new Map();
   locks = new Map();
 
@@ -27,6 +29,15 @@ class MemoryD1 {
       async run() { return database.run(normalized, this.values); },
       async first() { return database.first(normalized, this.values); },
     };
+  }
+
+  async batch(statements) {
+    const results = [];
+    for (const statement of statements) {
+      results.push(await statement.run());
+      await this.afterBatchStatement?.(results.length, statement);
+    }
+    return results;
   }
 
   async run(query, values) {
@@ -42,6 +53,33 @@ class MemoryD1 {
       if (this.locks.get(userId)?.owner === owner) this.locks.delete(userId);
       return { meta: { changes: 1 } };
     }
+    if (query.startsWith("DELETE FROM NR_CONNECTIONS WHERE USER_ID = ?")) {
+      const changed = this.connections.delete(values[0]);
+      return { meta: { changes: changed ? 1 : 0 } };
+    }
+    if (query.startsWith("DELETE FROM NR_PREFERENCES WHERE USER_ID = ?")) {
+      const changed = this.preferences.delete(values[0]);
+      return { meta: { changes: changed ? 1 : 0 } };
+    }
+    if (query.startsWith("INSERT INTO NR_PREFERENCES")) {
+      const [user_id, account_id, account_name, updated_at] = values;
+      this.preferences.set(user_id, { user_id, account_id, account_name, updated_at });
+      return { meta: { changes: 1 } };
+    }
+    if (query.startsWith("DELETE FROM NR_OAUTH_STATES WHERE USER_ID = ?")) {
+      let changes = 0;
+      for (const [key, row] of this.states) if (row.user_id === values[0]) { this.states.delete(key); changes += 1; }
+      return { meta: { changes } };
+    }
+    if (query.startsWith("UPDATE NR_OAUTH_STATES SET CONSUMED_AT = ?")) {
+      const [consumedAt, stateHash, userId, expiresAt] = values;
+      const row = this.states.get(stateHash);
+      if (row?.user_id === userId && row.consumed_at == null && row.expires_at >= expiresAt) {
+        row.consumed_at = consumedAt;
+        return { meta: { changes: 1 } };
+      }
+      return { meta: { changes: 0 } };
+    }
     if (query.startsWith("UPDATE NR_CONNECTIONS SET ENCRYPTED_ACCESS_TOKEN")) {
       const [access, refresh, expiry, userId, oldRefresh, lockUser, owner, now] = values;
       const row = this.connections.get(userId);
@@ -56,14 +94,15 @@ class MemoryD1 {
     }
     if (query.startsWith("INSERT INTO NR_OAUTH_STATES")) {
       const [state_hash, user_id, encrypted_verifier, redirect_uri, region, expires_at] = values;
-      this.states.set(state_hash, { state_hash, user_id, encrypted_verifier, redirect_uri, region, expires_at });
+      this.states.set(state_hash, { state_hash, user_id, encrypted_verifier, redirect_uri, region, expires_at, consumed_at: null });
       return { meta: { changes: 1 } };
     }
     if (query.startsWith("DELETE FROM NR_OAUTH_STATES WHERE STATE_HASH = ? AND USER_ID = ?")) {
-      const [stateHash, userId] = values;
+      const [stateHash, userId, consumedAt] = values;
       const row = this.states.get(stateHash);
-      if (row?.user_id === userId) this.states.delete(stateHash);
-      return { meta: { changes: row?.user_id === userId ? 1 : 0 } };
+      const allowed = row?.user_id === userId && (values.length < 3 || row.consumed_at === consumedAt);
+      if (allowed) this.states.delete(stateHash);
+      return { meta: { changes: allowed ? 1 : 0 } };
     }
     if (query.startsWith("DELETE FROM NR_RATE_LIMITS")) {
       const [userId, before] = values;
@@ -79,7 +118,11 @@ class MemoryD1 {
       return { meta: { changes: 1 } };
     }
     if (query.startsWith("INSERT INTO NR_CONNECTIONS")) {
-      const [user_id, encrypted_access_token, encrypted_refresh_token, access_expires_at, connected_at, region] = values;
+      const [user_id, encrypted_access_token, encrypted_refresh_token, access_expires_at, connected_at, region, stateHash, expectedUserId, consumedAt, nowSeconds] = values;
+      if (query.includes("WHERE EXISTS (SELECT 1 FROM NR_OAUTH_STATES")) {
+        const state = this.states.get(stateHash);
+        if (state?.user_id !== expectedUserId || state.consumed_at !== consumedAt || state.expires_at < nowSeconds) return { meta: { changes: 0 } };
+      }
       this.connections.set(user_id, { user_id, encrypted_access_token, encrypted_refresh_token, access_expires_at, connected_at, region });
       return { meta: { changes: 1 } };
     }
@@ -88,7 +131,7 @@ class MemoryD1 {
 
   async first(query, values) {
     if (query.includes("FROM NR_CONNECTIONS WHERE USER_ID = ?")) { const row = this.connections.get(values[0]); return row ? { ...row } : null; }
-    if (query.includes("FROM NR_PREFERENCES WHERE USER_ID = ?")) return null;
+    if (query.includes("FROM NR_PREFERENCES WHERE USER_ID = ?")) return this.preferences.get(values[0]) || null;
     if (query.startsWith("SELECT USER_ID, ENCRYPTED_VERIFIER")) return this.states.get(values[0]) || null;
     if (query.startsWith("SELECT CALL_COUNT FROM NR_RATE_LIMITS")) {
       const [userId, windowStart] = values;
@@ -98,14 +141,17 @@ class MemoryD1 {
   }
 }
 
-async function call(method, params = {}) {
+async function call(method, params = {}, env = {}, identity = null, id = 1) {
+  const headers = { "content-type": "application/json" };
+  if (identity) headers["oai-authenticated-user-id"] = identity;
   const request = new Request("https://example.test/mcp", {
     method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+    headers,
+    body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),
   });
-  const response = await worker.fetch(request, {});
-  return { response, payload: await response.json() };
+  const response = await worker.fetch(request, env);
+  const raw = await response.text();
+  return { response, raw, payload: JSON.parse(raw) };
 }
 
 const discovery = await call("server/discover");
@@ -132,9 +178,33 @@ assert.equal(listed.payload.result.tools.find((tool) => tool.name === "disconnec
 assert.equal(listed.payload.result.tools.find((tool) => tool.name === "disconnect_new_relic").annotations.destructiveHint, true);
 assert.equal(listed.payload.result.tools.find((tool) => tool.name === "execute_nrql").annotations.readOnlyHint, true);
 
+const rejectedContentType = await worker.fetch(new Request("https://example.test/mcp", {
+  method: "POST", headers: { "content-type": "text/plain" }, body: JSON.stringify({ jsonrpc: "2.0", id: 4, method: "tools/list" }),
+}), {});
+assert.equal((await rejectedContentType.json()).error.code, -32600);
+const oversizedStream = new ReadableStream({
+  start(controller) { controller.enqueue(new Uint8Array(16 * 1024 + 1)); controller.close(); },
+});
+const rejectedOversizedBody = await worker.fetch(new Request("https://example.test/mcp", {
+  method: "POST", headers: { "content-type": "application/json" }, body: oversizedStream, duplex: "half",
+}), {});
+assert.equal((await rejectedOversizedBody.json()).error.message, "Request too large");
+const oversizedApiBody = new ReadableStream({
+  start(controller) { controller.enqueue(new Uint8Array(8193)); controller.close(); },
+});
+const rejectedOversizedApi = await worker.fetch(new Request("https://example.test/api/oauth/manual-complete", {
+  method: "POST", headers: { "content-type": "application/json", origin: "https://example.test", "oai-authenticated-user-id": "test-user" },
+  body: oversizedApiBody, duplex: "half",
+}), {});
+assert.equal((await rejectedOversizedApi.json()).error, "リクエストが大きすぎます。");
+
 const pong = await call("tools/call", { name: "ping", arguments: {} });
 assert.equal(pong.payload.result.content[0].text, "pong");
 assert.equal(pong.payload.result.structuredContent.ok, true);
+const oversizedId = await call("tools/call", { name: "ping", arguments: {} }, {}, null, "x".repeat(12000));
+assert.equal(oversizedId.payload.error.code, -32600);
+assert.equal(oversizedId.payload.id, null);
+assert.ok(new TextEncoder().encode(oversizedId.raw).byteLength <= 10000, "oversized request IDs must not defeat the MCP response budget");
 const unknown = await call("tools/call", { name: "unknown_tool", arguments: {} });
 assert.equal(unknown.payload.error.code, -32602);
 
@@ -297,6 +367,75 @@ try {
   assert.equal(replay.status, 401);
   const replayText = await replay.text();
   assert.equal(replayText.includes("one-time-test-code"), false);
+
+  const readTool = { name: "fixture_read", inputSchema: { type: "object", properties: {}, required: [], additionalProperties: false } };
+  let upstreamToolCalls = 0;
+  globalThis.fetch = async (_url, options) => {
+    const request = JSON.parse(options.body);
+    if (request.method === "notifications/initialized") return new Response(null, { status: 202 });
+    if (request.method === "initialize") return Response.json({ jsonrpc: "2.0", id: request.id, result: {} });
+    if (request.method === "tools/list") return Response.json({ jsonrpc: "2.0", id: request.id, result: { tools: [
+      readTool, { name: "list_available_new_relic_accounts", inputSchema: { type: "object", properties: {}, additionalProperties: false } },
+    ] } });
+    if (request.method === "tools/call") {
+      upstreamToolCalls += 1;
+      return Response.json({ jsonrpc: "2.0", id: request.id, result: { content: [{ type: "text", text: "fixture" }] } });
+    }
+    throw new Error("Unexpected MCP method " + request.method);
+  };
+  const unreviewed = await call("tools/call", { name: "read_official_mcp", arguments: { toolName: "fixture_read", arguments: {} } }, oauthEnv, identity);
+  assert.match(unreviewed.payload.result.content[0].text, /policy_not_reviewed/);
+  assert.equal(upstreamToolCalls, 0, "unreviewed generic requests must not perform hidden account-list calls");
+
+  const schemaHash = await schemaFingerprint(readTool);
+  const reviewedEnv = { ...oauthEnv, NEW_RELIC_MCP_POLICIES: JSON.stringify({ fixture_read: {
+    schemaHash, operation: "read", billing: "core_compute", preview: false, scope: "identity",
+  } }), NEW_RELIC_ENABLE_METERED_READS: "true" };
+  globalThis.fetch = async (_url, options) => {
+    const request = JSON.parse(options.body);
+    if (request.method === "notifications/initialized") return new Response(null, { status: 202 });
+    if (request.method === "initialize") return Response.json({ jsonrpc: "2.0", id: request.id, result: {} });
+    if (request.method === "tools/list") return Response.json({ jsonrpc: "2.0", id: request.id, result: { tools: [readTool] } });
+    if (request.method === "tools/call") {
+      upstreamToolCalls += 1;
+      return Response.json({ jsonrpc: "2.0", id: request.id, result: { content: [{ type: "text", text: "測".repeat(10000) }] } });
+    }
+    throw new Error("Unexpected MCP method " + request.method);
+  };
+  const bounded = await call("tools/call", { name: "read_official_mcp", arguments: { toolName: "fixture_read", arguments: {} } }, reviewedEnv, identity);
+  assert.equal(bounded.payload.result.isError, undefined);
+  assert.ok(new TextEncoder().encode(bounded.raw).byteLength <= 10000, "combined MCP result must fit the byte budget");
+  assert.equal(upstreamToolCalls, 1);
+
+  const pendingStart = await beginNewRelicAuthorization(
+    new Request("https://example.test/oauth/start?region=jp"), oauthEnv, userId, "jp",
+  );
+  const pendingUrl = new URL(pendingStart.headers.get("location"));
+  const pendingCallback = pendingUrl.searchParams.get("redirect_uri") + "?code=pending-test-code&state=" + encodeURIComponent(pendingUrl.searchParams.get("state"));
+  let releaseExchange;
+  let markExchangeStarted;
+  const exchangeStarted = new Promise((resolve) => { markExchangeStarted = resolve; });
+  const pendingTokenResponse = new Promise((resolve) => { releaseExchange = resolve; });
+  globalThis.fetch = async () => { markExchangeStarted(); return pendingTokenResponse; };
+  const completion = completePastedNewRelicAuthorization(pendingCallback, oauthEnv, userId);
+  await exchangeStarted;
+  let completionFailure;
+  database.afterBatchStatement = async (statementNumber) => {
+    if (statementNumber !== 1) return;
+    // Simulate the precise race window that existed when disconnect used
+    // separate awaits: the OAuth completion runs after the state fence but
+    // before the connection deletion statement. D1 itself keeps batch atomic.
+    releaseExchange(new Response(JSON.stringify({ access_token: "late-access-token", refresh_token: "late-refresh-token", expires_in: 300 }), {
+      status: 200, headers: { "content-type": "application/json" },
+    }));
+    await completionFailure;
+  };
+  completionFailure = assert.rejects(completion, (error) => error.code === "oauth_connection_cancelled" && error.requiresReauthentication === true);
+  await disconnectNewRelic(oauthEnv, userId);
+  await completionFailure;
+  database.afterBatchStatement = undefined;
+  assert.equal(database.connections.has(userId), false, "a callback finishing after disconnect must not recreate credentials");
+  assert.equal(database.states.size, 0);
 } finally {
   globalThis.fetch = originalFetch;
 }
@@ -304,6 +443,149 @@ try {
 const manualPageResponse = await worker.fetch(new Request("https://example.test/oauth/complete"), {});
 assert.equal(manualPageResponse.status, 200);
 assert.match(await manualPageResponse.text(), /api\/oauth\/manual-complete/);
+
+// `get_connection_status` performs a refresh-capable lookup. A failing provider
+// must not let that request bypass the per-user limiter before attempting OAuth.
+const statusDb = new MemoryD1();
+const statusUserId = await siteUserId(new Request("https://example.test/", {
+  headers: { "oai-authenticated-user-id": "status-rate-limit-identity" },
+}));
+statusDb.connections.set(statusUserId, {
+  user_id: statusUserId,
+  encrypted_access_token: await encryptSecret("expired-access", env),
+  encrypted_refresh_token: await encryptSecret("revoked-refresh", env),
+  access_expires_at: Date.now() + 1000,
+  connected_at: Date.now(),
+  region: "jp",
+});
+const statusEnv = { ...env, DB: statusDb };
+let statusRefreshCalls = 0;
+globalThis.fetch = async () => {
+  statusRefreshCalls += 1;
+  return Response.json({ error: "invalid_grant" }, { status: 400 });
+};
+for (let index = 0; index < 25; index += 1) {
+  await call("tools/call", { name: "get_connection_status", arguments: {} }, statusEnv, "status-rate-limit-identity");
+}
+assert.equal(statusRefreshCalls, 20, "status refreshes must be limited before the provider request");
+assert.equal(statusDb.rates.get(statusUserId + ":" + Math.floor(Date.now() / 60000)).call_count, 25);
+globalThis.fetch = originalFetch;
+
+// OAuth and ordinary status/read traffic use separate quota buckets.
+const quotaDb = new MemoryD1();
+for (let index = 0; index < 5; index += 1) {
+  const statusResponse = await worker.fetch(new Request("https://example.test/api/status", {
+    headers: { "oai-authenticated-user-id": "quota-separation-identity" },
+  }), { ...env, DB: quotaDb });
+  assert.equal(statusResponse.status, 200);
+}
+const oauthStartResponse = await worker.fetch(new Request("https://example.test/oauth/start?region=jp", {
+  headers: { "oai-authenticated-user-id": "quota-separation-identity" },
+}), { ...env, DB: quotaDb });
+assert.equal(oauthStartResponse.status, 302, "ordinary status calls must not exhaust the separate OAuth rate bucket");
+
+const profileDb = new MemoryD1();
+const profileIdentity = "large-account-name-identity";
+const profileUserId = await siteUserId(new Request("https://example.test/", {
+  headers: { "oai-authenticated-user-id": profileIdentity },
+}));
+profileDb.connections.set(profileUserId, {
+  user_id: profileUserId,
+  encrypted_access_token: await encryptSecret("profile-access", env),
+  encrypted_refresh_token: await encryptSecret("profile-refresh", env),
+  access_expires_at: Date.now() + 60000,
+  connected_at: Date.now(),
+  region: "jp",
+});
+profileDb.preferences.set(profileUserId, {
+  user_id: profileUserId,
+  account_id: "123",
+  account_name: "A".repeat(20000),
+  updated_at: Date.now(),
+});
+const profileResponse = await worker.fetch(new Request("https://example.test/api/status", {
+  headers: { "oai-authenticated-user-id": profileIdentity },
+}), { ...env, DB: profileDb });
+const profileRaw = await profileResponse.text();
+assert.equal(profileResponse.status, 200);
+assert.ok(new TextEncoder().encode(profileRaw).byteLength <= 10000, "stored account names must not exceed the API response budget");
+assert.equal(JSON.parse(profileRaw).selectedAccount.name.length, 512);
+
+const selectionDb = new MemoryD1();
+const selectionIdentity = "large-provider-account-name-identity";
+const selectionUserId = await siteUserId(new Request("https://example.test/", {
+  headers: { "oai-authenticated-user-id": selectionIdentity },
+}));
+selectionDb.connections.set(selectionUserId, {
+  user_id: selectionUserId,
+  encrypted_access_token: await encryptSecret("selection-access", env),
+  encrypted_refresh_token: await encryptSecret("selection-refresh", env),
+  access_expires_at: Date.now() + 60000,
+  connected_at: Date.now(),
+  region: "jp",
+});
+globalThis.fetch = async (_url, options) => {
+  const request = JSON.parse(options.body);
+  if (request.method === "notifications/initialized") return new Response(null, { status: 202 });
+  if (request.method === "initialize") return Response.json({ jsonrpc: "2.0", id: request.id, result: {} });
+  if (request.method === "tools/list") return Response.json({ jsonrpc: "2.0", id: request.id, result: { tools: [
+    { name: "list_available_new_relic_accounts", inputSchema: { type: "object", properties: {}, additionalProperties: false } },
+  ] } });
+  if (request.method === "tools/call") return Response.json({ jsonrpc: "2.0", id: request.id, result: {
+    content: [{ type: "text", text: JSON.stringify({ accounts: [{ accountId: "123", accountName: "B".repeat(20000) }] }) }],
+  } });
+  throw new Error("Unexpected MCP method " + request.method);
+};
+const selectionResponse = await worker.fetch(new Request("https://example.test/api/select-account", {
+  method: "POST",
+  headers: {
+    "content-type": "application/json",
+    origin: "https://example.test",
+    "oai-authenticated-user-id": selectionIdentity,
+  },
+  body: JSON.stringify({ accountId: "123" }),
+}), { ...env, DB: selectionDb, NEW_RELIC_ENABLE_METERED_READS: "true" });
+const selectionRaw = await selectionResponse.text();
+assert.equal(selectionResponse.status, 200);
+assert.ok(new TextEncoder().encode(selectionRaw).byteLength <= 10000, "provider account names must be bounded before selection responses");
+assert.equal(JSON.parse(selectionRaw).selectedAccount.name.length, 512);
+globalThis.fetch = originalFetch;
+
+// Bounding the object before JSON escaping was insufficient for catalogs with
+// repeated backslashes. Verify the complete API response remains within budget.
+const capsDb = new MemoryD1();
+const capsIdentity = "capabilities-size-identity";
+const capsUserId = await siteUserId(new Request("https://example.test/", {
+  headers: { "oai-authenticated-user-id": capsIdentity },
+}));
+capsDb.connections.set(capsUserId, {
+  user_id: capsUserId,
+  encrypted_access_token: await encryptSecret("caps-access", env),
+  encrypted_refresh_token: await encryptSecret("caps-refresh", env),
+  access_expires_at: Date.now() + 60000,
+  connected_at: Date.now(),
+  region: "jp",
+});
+const capsTools = Array.from({ length: 40 }, (_, index) => ({
+  name: "fixture" + index,
+  description: "\\".repeat(900),
+  inputSchema: { type: "object", properties: {}, additionalProperties: false },
+}));
+globalThis.fetch = async (_url, options) => {
+  const request = JSON.parse(options.body);
+  if (request.method === "notifications/initialized") return new Response(null, { status: 202 });
+  if (request.method === "initialize") return Response.json({ jsonrpc: "2.0", id: request.id, result: {} });
+  if (request.method === "tools/list") return Response.json({ jsonrpc: "2.0", id: request.id, result: { tools: capsTools } });
+  throw new Error("Unexpected MCP method " + request.method);
+};
+const capsResponse = await worker.fetch(new Request("https://example.test/api/capabilities", {
+  headers: { "oai-authenticated-user-id": capsIdentity },
+}), { ...env, DB: capsDb });
+const capsRaw = await capsResponse.text();
+assert.equal(capsResponse.status, 200);
+assert.ok(new TextEncoder().encode(capsRaw).byteLength <= 10000, "API capability response must stay within the serialized byte budget");
+assert.equal(JSON.parse(capsRaw).truncated, true);
+globalThis.fetch = originalFetch;
 
 const concurrentDb = new MemoryD1();
 concurrentDb.connections.set(userId, { user_id: userId, encrypted_access_token: await encryptSecret("expired-token", env), encrypted_refresh_token: await encryptSecret("refresh-one", env), access_expires_at: 0, connected_at: Date.now(), region: "us" });

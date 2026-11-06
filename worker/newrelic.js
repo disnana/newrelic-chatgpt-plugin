@@ -7,6 +7,16 @@ const MCP_ENDPOINTS = {
   jp: "https://mcp.jp.newrelic.com/mcp/",
 };
 const MCP_PROTOCOL_VERSION = "2025-03-26";
+const LEGACY_CORE_COMPUTE_TOOLS = new Set([
+  "list_available_new_relic_accounts", "list_new_relic_accounts", "list_accounts",
+  "list_metric_names", "search_metric_names",
+  "execute_nrql_query", "execute_nrql", "run_nrql_query",
+  "list_recent_issues", "search_incident", "list_alert_policies",
+]);
+const LEGACY_ADVANCED_COMPUTE_TOOLS = new Set([
+  "natural_language_to_nrql_query", "analyze_deployment_impact",
+  "generate_alert_insights_report", "generate_user_impact_report",
+]);
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
@@ -213,7 +223,7 @@ async function exchangeAuthorizationResponse({ state, code, error, redirectUri }
   const db = database(env);
   const stateHash = bytesToBase64Url(await hash(state));
   const flow = await db.prepare(
-    "SELECT user_id, encrypted_verifier, redirect_uri, region, expires_at FROM nr_oauth_states WHERE state_hash = ?",
+    "SELECT user_id, encrypted_verifier, redirect_uri, region, expires_at, consumed_at FROM nr_oauth_states WHERE state_hash = ?",
   ).bind(stateHash).first();
   if (!flow || flow.user_id !== expectedUserId) {
     throw new NewRelicAuthError("この認証URLは現在のChatGPTアカウントの接続操作と一致しません。接続をやり直してください。");
@@ -226,14 +236,22 @@ async function exchangeAuthorizationResponse({ state, code, error, redirectUri }
       .bind(stateHash, expectedUserId).run();
     throw new Error("OAuthの確認状態が期限切れです。接続をやり直してください。");
   }
+  if (flow.consumed_at !== null && flow.consumed_at !== undefined) {
+    throw new Error("OAuthの確認状態はすでに使用済みです。接続をやり直してください。");
+  }
+  const claimedAt = Date.now();
   const consumeResult = await db.prepare(
-    "DELETE FROM nr_oauth_states WHERE state_hash = ? AND user_id = ?",
-  ).bind(stateHash, expectedUserId).run();
+    "UPDATE nr_oauth_states SET consumed_at = ? WHERE state_hash = ? AND user_id = ? AND consumed_at IS NULL AND expires_at >= ?",
+  ).bind(claimedAt, stateHash, expectedUserId, Math.floor(claimedAt / 1000)).run();
   if (Number(consumeResult?.meta?.changes || 0) !== 1) {
     throw new Error("OAuthの確認状態はすでに使用済みです。接続をやり直してください。");
   }
   const consumed = flow;
-  if (error) throw new NewRelicAuthError("New Relicへの接続が完了しませんでした。接続をやり直してください。");
+  if (error) {
+    await db.prepare("DELETE FROM nr_oauth_states WHERE state_hash = ? AND user_id = ? AND consumed_at = ?")
+      .bind(stateHash, expectedUserId, claimedAt).run();
+    throw new NewRelicAuthError("New Relicへの接続が完了しませんでした。接続をやり直してください。");
+  }
 
   const verifier = await decryptSecret(consumed.encrypted_verifier, env);
   const token = await tokenRequest({
@@ -251,9 +269,15 @@ async function exchangeAuthorizationResponse({ state, code, error, redirectUri }
   const accessExpiresAt = tokenExpiry(token);
   const encryptedAccess = await encryptSecret(token.access_token, env);
   const encryptedRefresh = await encryptSecret(token.refresh_token, env);
-  await db.prepare(
-    "INSERT INTO nr_connections (user_id, encrypted_access_token, encrypted_refresh_token, access_expires_at, connected_at, region) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET encrypted_access_token = excluded.encrypted_access_token, encrypted_refresh_token = excluded.encrypted_refresh_token, access_expires_at = excluded.access_expires_at, connected_at = excluded.connected_at, region = excluded.region",
-  ).bind(consumed.user_id, encryptedAccess, encryptedRefresh, accessExpiresAt, now, validRegion(consumed.region)).run();
+  const saved = await db.prepare(
+    "INSERT INTO nr_connections (user_id, encrypted_access_token, encrypted_refresh_token, access_expires_at, connected_at, region) SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM nr_oauth_states WHERE state_hash = ? AND user_id = ? AND consumed_at = ? AND expires_at >= ?) ON CONFLICT(user_id) DO UPDATE SET encrypted_access_token = excluded.encrypted_access_token, encrypted_refresh_token = excluded.encrypted_refresh_token, access_expires_at = excluded.access_expires_at, connected_at = excluded.connected_at, region = excluded.region",
+  ).bind(consumed.user_id, encryptedAccess, encryptedRefresh, accessExpiresAt, now,
+    validRegion(consumed.region), stateHash, expectedUserId, claimedAt, Math.floor(now / 1000)).run();
+  if (Number(saved?.meta?.changes || 0) !== 1) {
+    throw new NewRelicAuthError("接続解除または認証フローの変更を確認したため、新しい認証情報は保存しませんでした。接続をやり直してください。", "oauth_connection_cancelled");
+  }
+  await db.prepare("DELETE FROM nr_oauth_states WHERE state_hash = ? AND user_id = ? AND consumed_at = ?")
+    .bind(stateHash, expectedUserId, claimedAt).run();
   return { connected: true, region: validRegion(consumed.region) };
 }
 
@@ -325,6 +349,7 @@ export async function getConnectionStatus(env, userId) {
     accessTokenExpiresAt: Number(currentConnection.access_expires_at),
     region: validRegion(currentConnection.region),
     selectedAccount: await getSelectedAccount(env, userId),
+    meteredReadsEnabled: env?.NEW_RELIC_ENABLE_METERED_READS === "true",
     requiresReauthentication,
     refreshError,
     refreshPolicy: { proactiveWindowSeconds: 30, providerReauthenticationHours: 24 },
@@ -337,41 +362,52 @@ export async function getSelectedAccount(env, userId) {
     "SELECT account_id, account_name, updated_at FROM nr_preferences WHERE user_id = ?",
   ).bind(userId).first();
   if (!row) return null;
+  const id = String(row.account_id);
+  if (!id || id.length > 128) return null;
   return {
-    id: String(row.account_id),
-    name: row.account_name ? String(row.account_name) : "",
+    id,
+    name: row.account_name ? String(row.account_name).slice(0, 512) : "",
     updatedAt: Number(row.updated_at),
   };
 }
 
 export async function saveSelectedAccount(env, userId, account) {
   if (!userId) throw new Error("ChatGPTのSiteセッションを確認できません。");
+  const accountId = String(account?.id ?? "");
+  if (!accountId || accountId.length > 128) throw new Error("New RelicアカウントIDが不正です。");
   await database(env).prepare(
     "INSERT INTO nr_preferences (user_id, account_id, account_name, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET account_id = excluded.account_id, account_name = excluded.account_name, updated_at = excluded.updated_at",
-  ).bind(userId, String(account.id), String(account.name || ""), Date.now()).run();
+  ).bind(userId, accountId, String(account.name || "").slice(0, 512), Date.now()).run();
 }
 
 export async function disconnectNewRelic(env, userId) {
   if (!userId) throw new Error("ChatGPTのSiteセッションを確認できません。");
   const db = database(env);
-  await db.prepare("DELETE FROM nr_connections WHERE user_id = ?").bind(userId).run();
-  await db.prepare("DELETE FROM nr_preferences WHERE user_id = ?").bind(userId).run();
-  await db.prepare("DELETE FROM nr_oauth_states WHERE user_id = ?").bind(userId).run();
+  // D1 batch is atomic. Remove the OAuth completion fence first so an in-flight
+  // callback cannot pass its state-row check and recreate credentials while
+  // disconnect is deleting the saved connection.
+  await db.batch([
+    db.prepare("DELETE FROM nr_oauth_states WHERE user_id = ?").bind(userId),
+    db.prepare("DELETE FROM nr_connections WHERE user_id = ?").bind(userId),
+    db.prepare("DELETE FROM nr_preferences WHERE user_id = ?").bind(userId),
+  ]);
   return { connected: false, localConnectionRemoved: true, providerGrantRevoked: false };
 }
 
-export async function consumeRateLimit(env, userId, limit = 20) {
+export async function consumeRateLimit(env, userId, limit = 20, bucket = "default") {
   if (!userId) throw new NewRelicAuthError("ChatGPTのSiteセッションを確認できません。");
   const db = database(env);
+  if (!/^[a-z0-9_-]{1,32}$/i.test(bucket)) throw new Error("レート制限区分が不正です。");
+  const rateLimitUserId = bucket === "default" ? userId : `${userId}:${bucket}`;
   const windowStart = Math.floor(Date.now() / 60000);
   await db.prepare("DELETE FROM nr_rate_limits WHERE user_id = ? AND window_start < ?")
-    .bind(userId, windowStart - 120).run();
+    .bind(rateLimitUserId, windowStart - 120).run();
   await db.prepare(
     "INSERT INTO nr_rate_limits (user_id, window_start, call_count) VALUES (?, ?, 1) ON CONFLICT(user_id, window_start) DO UPDATE SET call_count = call_count + 1",
-  ).bind(userId, windowStart).run();
+  ).bind(rateLimitUserId, windowStart).run();
   const row = await db.prepare(
     "SELECT call_count FROM nr_rate_limits WHERE user_id = ? AND window_start = ?",
-  ).bind(userId, windowStart).first();
+  ).bind(rateLimitUserId, windowStart).first();
   if (Number(row?.call_count || 0) > limit) {
     throw new NewRelicRemoteError("呼び出し回数の上限に達しました。1分ほど待ってから再試行してください。");
   }
@@ -624,6 +660,28 @@ function buildUpstreamArguments(tool, values) {
 }
 
 async function callRemoteTool(session, toolName, values = {}, raw = false) {
+  if (!raw) {
+    if (LEGACY_CORE_COMPUTE_TOOLS.has(toolName)) {
+      if (session.allowMeteredReads !== true) {
+        throw new NewRelicRemoteError(
+          "この読み取りはNew Relic Core Compute (CCU) などの利用量が発生する可能性があるため既定で停止しています。Site管理者は契約と費用を確認したうえで、明示的な有効化が必要です。",
+          "metered_reads_disabled",
+        );
+      }
+    } else if (LEGACY_ADVANCED_COMPUTE_TOOLS.has(toolName)) {
+      if (session.allowAdvancedCompute !== true) {
+        throw new NewRelicRemoteError(
+          "このAI分析はAdvanced Compute (aCCU) 契約を必要とするため、明示的な有効化まで停止しています。",
+          "advanced_compute_opt_in_required",
+        );
+      }
+    } else {
+      throw new NewRelicRemoteError(
+        "この高レベル経路の課金区分が確認できず停止しています。スキーマ審査済みの汎用ポリシーを使用してください。",
+        "legacy_tool_billing_unverified",
+      );
+    }
+  }
   session.callCount += 1;
   if (session.callCount > 8) {
     throw new NewRelicRemoteError("1回の調査で実行できるNew Relic呼び出し数の上限に達しました。");
@@ -658,10 +716,18 @@ export async function withNewRelicSession(env, userId, callback, options = {}) {
     const endpoint = MCP_ENDPOINTS[auth.region];
     try {
       const session = await startRemoteSession(endpoint, auth.token);
+      session.allowMeteredReads = env?.NEW_RELIC_ENABLE_METERED_READS === "true";
+      session.allowAdvancedCompute = env?.NEW_RELIC_ENABLE_ADVANCED_COMPUTE === "true";
       return await callback(session);
     } catch (error) {
       lastError = error;
-      if (!(error instanceof NewRelicAuthError) || !error.refreshable || attempt === 1 || options.readOnly === false) throw error;
+      if (!(error instanceof NewRelicAuthError) || !error.refreshable || options.readOnly === false) throw error;
+      if (attempt === 1) {
+        throw new NewRelicAuthError(
+          "New Relicは更新後のアクセストークンも拒否しました。自動更新を試したため、New Relicへの再接続が必要です。",
+          "access_token_rejected_after_refresh",
+        );
+      }
       failedToken = auth.token;
     }
   }

@@ -7,6 +7,7 @@ sql = (root / "drizzle" / "0000_newrelic_mcp.sql").read_text(encoding="utf-8")
 connection = sqlite3.connect(":memory:")
 connection.executescript(sql)
 connection.executescript((root / "drizzle" / "0001_refresh_locks.sql").read_text(encoding="utf-8"))
+connection.executescript((root / "drizzle" / "0002_oauth_completion_fence.sql").read_text(encoding="utf-8"))
 
 tables = {
     row[0]
@@ -26,6 +27,9 @@ assert {
     "connected_at",
     "region",
 } == columns
+
+state_columns = {row[1] for row in connection.execute("PRAGMA table_info(nr_oauth_states)")}
+assert "consumed_at" in state_columns
 
 indexes = {row[1] for row in connection.execute("PRAGMA index_list(nr_oauth_states)")}
 assert {"nr_oauth_states_expiry", "nr_oauth_states_user"} <= indexes
