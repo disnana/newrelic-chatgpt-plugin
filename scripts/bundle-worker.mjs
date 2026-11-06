@@ -14,10 +14,11 @@ function wrapModule(name, source) {
   return `const __module_${name} = (() => {\nconst exports = Object.create(null);\n${body}\n${exports.map((key) => `exports[${JSON.stringify(key)}] = ${key};`).join("\n")}\nreturn exports;\n})();\n`;
 }
 
-const [entrySource, authSource, nrqlSource, page, oauthCompletePage] = await Promise.all([
+const [entrySource, authSource, nrqlSource, policySource, page, oauthCompletePage] = await Promise.all([
   read("worker/index.js"),
   read("worker/newrelic.js"),
   read("worker/nrql.js"),
+  read("worker/mcp-policy.js"),
   read("worker/page.html"),
   read("worker/oauth-complete.html"),
 ]);
@@ -30,7 +31,9 @@ let entry = entrySource
   .replace(/import\s*\{([\s\S]*?)\}\s*from\s*["']\.\/newrelic\.js["'];/g,
     "const {$1} = __module_newrelic;")
   .replace(/import\s*\{([\s\S]*?)\}\s*from\s*["']\.\/nrql\.js["'];/g,
-    "const {$1} = __module_nrql;");
+    "const {$1} = __module_nrql;")
+  .replace(/import\s*\{([\s\S]*?)\}\s*from\s*["']\.\/mcp-policy\.js["'];/g,
+    "const {$1} = __module_policy;");
 
 assert.doesNotMatch(entry, /^\s*import\s/m, "Worker entry still has an unresolved import");
 assert.match(entry, /export\s+default\s*\{/);
@@ -40,6 +43,7 @@ const bundle = [
   `const __module_page = Object.freeze({ default: ${JSON.stringify(page)} });`,
   `const __module_oauthCompletePage = Object.freeze({ default: ${JSON.stringify(oauthCompletePage)} });`,
   wrapModule("nrql", nrqlSource),
+  wrapModule("policy", policySource),
   wrapModule("newrelic", authSource),
   entry,
 ].join("\n");

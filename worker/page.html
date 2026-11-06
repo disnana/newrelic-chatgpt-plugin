@@ -171,6 +171,13 @@
             connectPanel.hidden = false;
             return;
           }
+          if (state.refreshError) {
+            setStatus("error", "認証情報の更新を確認できません");
+            identityHint.textContent = state.refreshError.message + " 保存済み情報は維持しています";
+            identityHint.hidden = false;
+            connectedPanel.hidden = false;
+            return;
+          }
           setStatus("connected", "New Relic接続済み");
           const date = state.connectedAt ? new Date(state.connectedAt).toLocaleString("ja-JP") : "";
           connectionDetail.textContent = "接続日時: " + (date || "不明") + " · リージョン: " + state.region.toUpperCase();

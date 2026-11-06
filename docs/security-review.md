@@ -23,3 +23,11 @@
 ## 検証が必要な事項
 
 第三者アカウントとの分離、並行refresh、OAuth期限切れ、複雑なNRQL、CSRF、プロンプトインジェクション、大容量ストリーム、公式MCP障害時の振る舞い。実際の認証情報や実データは公開用の試験データに使わない。
+
+## v0.4.0 scoped code review (2026-11-06)
+
+OAuth/transport and generic adapter received separate implementation and review passes. Review caught and fixed an OAuth route regression, malformed JSON Schema constraint acceptance, unvalidated provider response extras, metadata policy drift, and misleading reachability diagnostics. Regression and 23 OAuth mock tests plus policy tests pass locally. This is a scoped review, not independent certification or production assurance.
+
+Generic execution requires an exact tool-name policy, SHA-256 fingerprint of input/output schema and annotations/metadata, supported schema validation, account binding and explicit billing classification. Unknown or changed tools fail closed. Provider descriptions/annotations cannot authorize execution. Write/destructive and billable execution are not implemented; even a policy entry cannot enable them. Preview requires explicit deployment opt-in in addition to all other requirements.
+
+The generic policy does not wrap legacy high-level tools. Legacy NRQL limits and header-based hosting identity still have the risks listed above. Runtime entitlement/plan restrictions cannot reliably be distinguished from an opaque provider tool error; do not claim entitlement from catalog visibility alone. Redaction is best effort for arbitrary telemetry and cannot guarantee removal of every secret. No API keys or OAuth grants were generated, no production settings were changed, and no live rotation or multi-user deployment was tested.

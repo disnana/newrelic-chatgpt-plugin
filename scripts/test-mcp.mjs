@@ -335,7 +335,7 @@ const pagedDb = new MemoryD1();
 pagedDb.connections.set(userId, { user_id: userId, encrypted_access_token: await encryptSecret("paging-access", env), encrypted_refresh_token: await encryptSecret("paging-refresh", env), access_expires_at: Date.now() + 300000, connected_at: Date.now(), region: "us" });
 let listRequests = 0;
 globalThis.fetch = async (_url, options) => {
-  assert.equal(new Headers(options.headers).get("include-tags"), "discovery,data-access,alerting");
+  assert.equal(new Headers(options.headers).get("include-tags"), null);
   const request = JSON.parse(options.body);
   if (request.method === "notifications/initialized") return new Response(null, { status: 202 });
   if (request.method === "initialize") return Response.json({ jsonrpc: "2.0", id: request.id, result: {} });

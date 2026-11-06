@@ -79,3 +79,9 @@ python3 scripts/package-release.py v0.3.0
 ## ライセンス
 
 独自ソースはMIT。[権利関係](docs/license-notes.md)を参照。New RelicおよびOpenAIの公式製品・承認済み連携ではなく、各社のサービス・商標の権利を付与しません。
+
+## v0.4.0 development status
+
+OAuth failure classification and a fail-closed, schema-pinned generic MCP adapter are implemented. This is **not full official MCP parity**. The documented inventory contains 41 tools, but authenticated live schemas and new runtime execution remain unverified (0 live-verified generic tools). Most read calls can be CCU-metered. Write, destructive, billable and unreviewed tools remain disabled. Existing high-level tools remain available and retain their prior billing and safety limitations.
+
+See [migration and policy setup](docs/v0.4.0-migration.md), [official feature research](docs/official-mcp-research.md), [OAuth](docs/oauth.md), and [security review](docs/security-review.md). No production deployment is included.

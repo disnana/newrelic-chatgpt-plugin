@@ -5,10 +5,11 @@
   "scripts": {
     "build": "bash scripts/build.sh",
     "validate": "node scripts/validate-artifact.mjs",
-    "test": "node scripts/test-mcp.mjs",
+    "test": "node scripts/test-mcp.mjs && node scripts/test-oauth-v040.mjs && node scripts/test-mcp-policy.mjs",
     "check": "python3 scripts/check-distribution.py",
-    "package": "python3 scripts/package-release.py"
+    "package": "python3 scripts/package-release.py",
+    "lint": "node --check worker/index.js && node --check worker/newrelic.js && node --check worker/mcp-policy.js && node --check worker/nrql.js"
   },
-  "version": "0.3.0",
+  "version": "0.4.0",
   "license": "MIT"
 }

@@ -19,7 +19,9 @@ jobs:
       - run: python3 scripts/read-version.py
       - run: npm run build
       - run: node scripts/validate-artifact.mjs
-      - run: node scripts/test-mcp.mjs
+      - run: npm run lint
+      - run: npm test
+      - run: npm audit --omit=dev
       - run: python3 scripts/test-migrations.py
       - run: python3 -m unittest discover -s ops/scylla-gate -p 'test_*.py' -v
       - run: bash -n ops/scylla-gate/install.sh
