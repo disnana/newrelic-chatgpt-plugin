@@ -56,14 +56,18 @@
             credentials:"same-origin"
           });
           const result=await response.json();
-          if(!response.ok)throw new Error(result.error||"認証を完了できませんでした。");
+          if(!response.ok){
+            const error=new Error(result.error||"認証を完了できませんでした。");
+            if(typeof result.errorCode==="string")error.errorCode=result.errorCode;
+            throw error;
+          }
           input.value="";
           status.className="status success";
           status.textContent="New Relicに接続しました。接続状態ページを開きます…";
           setTimeout(()=>location.replace("/"),900);
         }catch(error){
           status.className="status error";
-          status.textContent=error.message||"認証を完了できませんでした。";
+          status.textContent=(error.message||"認証を完了できませんでした。")+(error.errorCode?" (code: "+error.errorCode+")":"");
           button.disabled=false;
         }
       });

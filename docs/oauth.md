@@ -27,3 +27,5 @@ https://docs.newrelic.com/docs/agentic-ai/mcp/overview/
 Workerの `/api/status` と `get_connection_status` は、保存済みD1メタデータだけを返し、New Relicへ接続せず、トークン更新もしません。`statusSource: local_metadata` と `tokenRefreshDue` は保存値の目安であり、トークンがNew Relic側で受理されるか・OAuth grantが有効かは証明しません。UIでは保存済み情報を未検証と表示し、再接続リンクを常に提示します。再接続は接続情報を削除せず開始でき、成功時にだけ新しい資格情報へ置き換わります。接続解除も行いません。
 
 実際のrefresh失敗コードを取得するには、期限切れトークンでNew RelicへOAuth refresh requestを送る必要があり、refresh tokenがローテーションされる可能性があります。`get_connection_status` の旧到達性プローブも公式MCPを初期化し、設定次第で利用量を消費する可能性がありました。安全な診断と課金禁止の条件を守るため、この環境ではライブ状態確認やrefreshを再実行していません。過去に表示された非秘密の `refreshError.code` があれば、それだけで分類できます。トークン・認可URL・コールバックURLは共有しないでください。
+
+今後、利用者が明示的に開始したOAuthまたはNew Relic操作が失敗した場合、API応答とMCP tool errorには固定allowlist内の非秘密 `errorCode` だけを付けます。New Relicの任意のエラーコード、`error_description`、トークンは返しません。これは直近の失敗応答にだけ含まれ、local status用には保存しません。たとえば `oauth_invalid_grant` は再接続が必要な失効・拒否、`oauth_configuration_error` はSite管理者のクライアント設定確認、`oauth_network_error` / `oauth_unavailable` は一時障害の分類を示します。これらのコードが、この利用者の過去の実接続障害原因を証明するものではありません。

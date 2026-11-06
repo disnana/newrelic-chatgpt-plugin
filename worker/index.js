@@ -37,6 +37,14 @@ const MCP_VERSION = "2026-07-28";
 const MAX_REQUEST_BYTES = 16 * 1024;
 const MAX_API_BODY_BYTES = 4 * 1024;
 const MAX_TOOL_RESULT_BYTES = 10000;
+const SAFE_DIAGNOSTIC_CODES = new Set([
+  "oauth_invalid_grant", "oauth_access_denied", "oauth_network_error", "oauth_rate_limited",
+  "oauth_unavailable", "oauth_configuration_error", "oauth_rejected", "oauth_connection_cancelled",
+  "invalid_token_response", "credential_storage_error", "connection_changed", "refresh_busy",
+  "access_token_rejected", "access_token_rejected_after_refresh", "permission_denied",
+  "provider_rate_limited", "invalid_mcp_response", "metered_reads_disabled",
+  "advanced_compute_opt_in_required", "legacy_tool_billing_unverified",
+]);
 const JSON_HEADERS = {
   "content-type": "application/json; charset=utf-8",
   "cache-control": "no-store",
@@ -193,8 +201,19 @@ function jsonError(id, code, message, status = 200) {
     status === 401 ? { "www-authenticate": "Bearer" } : {});
 }
 
-function toolError(message) {
-  return { content: [{ type: "text", text: String(redactSensitive(String(message))) }], isError: true };
+/** @param {unknown} error @returns {string|null} */
+function safeDiagnosticCode(error) {
+  if (!(error instanceof NewRelicAuthError || error instanceof NewRelicRemoteError)) return null;
+  return SAFE_DIAGNOSTIC_CODES.has(error.code) ? error.code : null;
+}
+
+/** @param {string} message @param {string|null} [errorCode] */
+function toolError(message, errorCode = null) {
+  const result = { content: [{ type: "text", text: String(redactSensitive(String(message))) }], isError: true };
+  if (typeof errorCode === "string" && SAFE_DIAGNOSTIC_CODES.has(errorCode)) {
+    result.structuredContent = { errorCode };
+  }
+  return result;
 }
 
 function redactSensitive(value, key = "") {
@@ -671,7 +690,7 @@ async function handleMcp(request, env) {
         return jsonResult(id, result);
       } catch (error) {
         const messageText = error instanceof Error ? error.message : "New Relicリクエストに失敗しました。";
-        return jsonResult(id, toolError(messageText));
+        return jsonResult(id, toolError(messageText, safeDiagnosticCode(error)));
       }
     }
     default:
@@ -801,6 +820,8 @@ function pageResponse(content = page) {
 function oauthErrorResponse(error) {
   let message = "OAuthを完了できませんでした。接続をやり直してください。";
   if (error instanceof NewRelicAuthError || error instanceof NewRelicRemoteError) message = error.message;
+  const errorCode = safeDiagnosticCode(error);
+  if (errorCode) message += " (code: " + errorCode + ")";
   const safeMessage = message.replace(/[&<>"]/g, (character) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;",
   })[character]);
@@ -871,7 +892,8 @@ export default {
       } catch (error) {
         const status = error instanceof NewRelicAuthError ? 401 : 502;
         const message = error instanceof Error ? error.message : "リクエストに失敗しました。";
-        return jsonResponse({ error: redactSensitive(message) }, status);
+        const errorCode = safeDiagnosticCode(error);
+        return jsonResponse({ error: redactSensitive(message), ...(errorCode ? { errorCode } : {}) }, status);
       }
     }
     if (pathname !== "/") return new Response("Not found", { status: 404, headers: { "cache-control": "no-store" } });

@@ -461,6 +461,38 @@ assert.equal(localMcpStatus.result.structuredContent.statusSource, "local_metada
 assert.equal(localApiStatus.connected, true);
 assert.equal(localMcpStatus.result.structuredContent.connected, true);
 assert.equal(signedStatusUpstreamCalls, 0, "expired status checks do not refresh or contact New Relic");
+const diagnosticOriginalFetch = globalThis.fetch;
+const diagnosticProviderCalls = [];
+globalThis.fetch = async (url) => {
+  diagnosticProviderCalls.push(new URL(String(url)).pathname);
+  if (diagnosticProviderCalls.length === 1) {
+    return Response.json({ error: "invalid_grant", error_description: "synthetic-private-token-marker" }, { status: 400 });
+  }
+  return Response.json({ error: "synthetic-provider-error-marker", error_description: "synthetic-private-token-marker" }, { status: 400 });
+};
+try {
+  const accountFailure = await worker.fetch(new Request("https://example.test/api/accounts", {
+    headers: { authorization: "Bearer " + ownerJwt, origin: "https://example.test" },
+  }), signedRuntimeEnv);
+  assert.equal(accountFailure.status, 401);
+  const accountFailureBody = await accountFailure.json();
+  assert.equal(accountFailureBody.errorCode, "oauth_invalid_grant");
+  assert.equal(JSON.stringify(accountFailureBody).includes("synthetic-private-token-marker"), false);
+  const mcpFailure = await worker.fetch(new Request("https://example.test/mcp", {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: "Bearer " + ownerJwt, origin: "https://example.test" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 12, method: "tools/call", params: { name: "list_accounts", arguments: {} } }),
+  }), signedRuntimeEnv);
+  const mcpFailureBody = await mcpFailure.json();
+  assert.equal(mcpFailureBody.result.structuredContent.errorCode, "oauth_rejected",
+    "provider-supplied error codes are mapped to a fixed safe diagnostic code");
+  assert.equal(JSON.stringify(mcpFailureBody).includes("synthetic-private-token-marker"), false);
+  assert.equal(JSON.stringify(mcpFailureBody).includes("synthetic-provider-error-marker"), false);
+} finally {
+  globalThis.fetch = diagnosticOriginalFetch;
+}
+assert.deepEqual(diagnosticProviderCalls, ["/oauth2/token", "/oauth2/token"],
+  "diagnostic code tests use only mocked OAuth refresh endpoints, not MCP read calls");
 const signedMutationWithoutOrigin = await worker.fetch(new Request("https://example.test/api/disconnect", {
   method: "POST", headers: { authorization: "Bearer " + ownerJwt },
 }), signedRuntimeEnv);
@@ -504,6 +536,7 @@ const fakeDocument = {
 };
 const uiRequests = [];
 let rejectAccountList = false;
+let rejectAccountSelection = false;
 const fakeFetch = async path => {
   uiRequests.push(path);
   if (path === "/api/status") return Response.json({
@@ -513,11 +546,14 @@ const fakeFetch = async path => {
     refreshError: null, providerReachable: null, statusSource: "local_metadata",
   });
   if (path === "/api/accounts") {
-    if (rejectAccountList) return Response.json({ error: "New Relic access requires reauthentication" }, { status: 401 });
+    if (rejectAccountList) return Response.json({ error: "New Relic access requires reauthentication", errorCode: "oauth_invalid_grant" }, { status: 401 });
     return Response.json({
       accounts: [{ id: "account-first", name: "First account" }, { id: "account-second", name: "Second account" }],
       selectedAccount: { id: "account-second", name: "Second account" },
     });
+  }
+  if (path === "/api/select-account" && rejectAccountSelection) {
+    return Response.json({ error: "New Relic access requires reauthentication", errorCode: "oauth_invalid_grant" }, { status: 401 });
   }
   throw new Error("Unexpected UI request " + path);
 };
@@ -534,9 +570,15 @@ assert.equal(uiElements.get("#account").children[0].selected, false);
 assert.equal(uiElements.get("#account").children[1].selected, true,
   "the saved account remains selected even when it is not the first listed account");
 assert.equal(uiElements.get("#select-account").disabled, false);
+uiElements.get("#account").value = "account-second";
+rejectAccountSelection = true;
+await uiElements.get("#select-account").listeners.click();
+assert.match(uiElements.get("#account-hint").textContent, /oauth_invalid_grant/,
+  "account-selection failures should display only the server's safe diagnostic code");
 rejectAccountList = true;
 await uiElements.get("#load-accounts").listeners.click();
 assert.match(uiElements.get("#account-hint").textContent, /reauthentication/);
+assert.match(uiElements.get("#account-hint").textContent, /oauth_invalid_grant/);
 assert.equal(uiElements.get("#reconnect-link").href, "/oauth/start?region=us",
   "provider reauthentication errors must leave a reconnect action available without deleting local credentials");
 const statusWithoutIdentity = await worker.fetch(new Request("https://example.test/api/status"), {});
@@ -810,7 +852,26 @@ try {
 
 const manualPageResponse = await worker.fetch(new Request("https://example.test/oauth/complete"), {});
 assert.equal(manualPageResponse.status, 200);
-assert.match(await manualPageResponse.text(), /api\/oauth\/manual-complete/);
+const manualPageHtml = await manualPageResponse.text();
+assert.match(manualPageHtml, /api\/oauth\/manual-complete/);
+const completionElements = new Map();
+const completionDocument = {
+  querySelector(selector) {
+    if (!completionElements.has(selector)) completionElements.set(selector, new FakeElement());
+    return completionElements.get(selector);
+  },
+};
+completionElements.set("#callback-url", Object.assign(new FakeElement(), { value: "http://localhost:12345/callback?code=synthetic&state=synthetic" }));
+runInNewContext(manualPageHtml.match(/<script>([\s\S]*?)<\/script>/)[1], {
+  document: completionDocument,
+  fetch: async () => Response.json({ error: "New Relic OAuth was rejected", errorCode: "oauth_invalid_grant" }, { status: 401 }),
+  Response, setTimeout, location: { replace() {} },
+});
+await completionElements.get("#complete-form").listeners.submit({ preventDefault() {} });
+assert.match(completionElements.get("#status").textContent, /oauth_invalid_grant/,
+  "OAuth completion failures should display the safe code while retaining the pasted URL for retry");
+assert.equal(completionElements.get("#submit-button").disabled, false);
+assert.equal(completionElements.get("#callback-url").value, "http://localhost:12345/callback?code=synthetic&state=synthetic");
 
 // Status uses local metadata only, even when the stored access token is near expiry.
 const statusDb = new MemoryD1();
