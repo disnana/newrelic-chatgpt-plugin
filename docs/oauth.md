@@ -21,3 +21,9 @@ https://docs.newrelic.com/docs/agentic-ai/mcp/overview/
 429 の明示的拒否は一回だけ再試行します。timeout / 5xx 時のトークン交換は、上流だけ rotation 済みの可能性があるため自動再送しません。D1 ユーザー別 lease と compare-and-swap を使って新旧トークンを一度に保存します。上流更新と D1 保存を跨ぐ分散トランザクションは不可能で、その間の障害は残存リスクです。
 
 ユーザーの実接続で起きている更新失敗の根本原因は、旧版の安全な診断情報だけでは確定できません。コードで確認した誤分類と、実接続の原因を混同しません。
+
+## 副作用のない接続状態確認
+
+Workerの `/api/status` と `get_connection_status` は、保存済みD1メタデータだけを返し、New Relicへ接続せず、トークン更新もしません。`statusSource: local_metadata` と `tokenRefreshDue` は保存値の目安であり、トークンがNew Relic側で受理されるか・OAuth grantが有効かは証明しません。接続解除も行いません。
+
+実際のrefresh失敗コードを取得するには、期限切れトークンでNew RelicへOAuth refresh requestを送る必要があり、refresh tokenがローテーションされる可能性があります。`get_connection_status` の旧到達性プローブも公式MCPを初期化し、設定次第で利用量を消費する可能性がありました。安全な診断と課金禁止の条件を守るため、この環境ではライブ状態確認やrefreshを再実行していません。過去に表示された非秘密の `refreshError.code` があれば、それだけで分類できます。トークン・認可URL・コールバックURLは共有しないでください。

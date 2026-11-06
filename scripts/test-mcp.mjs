@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { webcrypto } from "node:crypto";
 import { resolve } from "node:path";
+import { runInNewContext } from "node:vm";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 globalThis.crypto ||= webcrypto;
@@ -426,11 +427,35 @@ try {
 } finally {
   globalThis.fetch = signedOriginalFetch;
 }
-const signedOwnerStatus = await worker.fetch(new Request("https://example.test/api/status", {
-  headers: { authorization: "Bearer " + ownerJwt },
-}), signedRuntimeEnv);
+signedRuntimeEnv.DB.connections.get(ownerUserId).access_expires_at = Date.now() - 1000;
+const signedStatusFetch = globalThis.fetch;
+let signedStatusUpstreamCalls = 0;
+globalThis.fetch = async () => { signedStatusUpstreamCalls += 1; throw new Error("status must remain local"); };
+let signedOwnerStatus;
+let signedMcpStatus;
+try {
+  signedOwnerStatus = await worker.fetch(new Request("https://example.test/api/status", {
+    headers: { authorization: "Bearer " + ownerJwt },
+  }), signedRuntimeEnv);
+  signedMcpStatus = await worker.fetch(new Request("https://example.test/mcp", {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: "Bearer " + ownerJwt },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 11, method: "tools/call", params: { name: "get_connection_status", arguments: {} } }),
+  }), signedRuntimeEnv);
+} finally {
+  globalThis.fetch = signedStatusFetch;
+}
 assert.equal(signedOwnerStatus.status, 200);
-assert.equal((await signedOwnerStatus.json()).connected, true);
+const localApiStatus = await signedOwnerStatus.json();
+assert.equal(localApiStatus.tokenRefreshDue, true);
+assert.equal(localApiStatus.statusSource, "local_metadata");
+assert.equal(localApiStatus.providerReachable, null);
+const localMcpStatus = await signedMcpStatus.json();
+assert.equal(localMcpStatus.result.structuredContent.tokenRefreshDue, true);
+assert.equal(localMcpStatus.result.structuredContent.statusSource, "local_metadata");
+assert.equal(localApiStatus.connected, true);
+assert.equal(localMcpStatus.result.structuredContent.connected, true);
+assert.equal(signedStatusUpstreamCalls, 0, "expired status checks do not refresh or contact New Relic");
 const signedMutationWithoutOrigin = await worker.fetch(new Request("https://example.test/api/disconnect", {
   method: "POST", headers: { authorization: "Bearer " + ownerJwt },
 }), signedRuntimeEnv);
@@ -442,10 +467,59 @@ assert.equal(unknown.payload.error.code, -32602);
 const pageResponse = await worker.fetch(new Request("https://example.test/"), {});
 assert.equal(pageResponse.status, 200);
 const page = await pageResponse.text();
+assert.match(page, /id="load-accounts"/);
+assert.match(page, /loadAccountsButton\.addEventListener/);
+assert.doesNotMatch(page, /await loadAccounts\(state\.selectedAccount\)/, "opening or refreshing status must not automatically fetch a billed account list");
 assert.match(page, /lang="ja"/);
 assert.match(page, /New Relic公式OAuth/);
 assert.match(page, /prefers-color-scheme: dark/);
 assert.match(page, /requiresReauthentication/);
+const uiElements = new Map();
+class FakeElement {
+  children = [];
+  listeners = {};
+  dataset = {};
+  classList = { add() {}, remove() {} };
+  disabled = false;
+  hidden = false;
+  textContent = "";
+  addEventListener(type, callback) { this.listeners[type] = callback; }
+  replaceChildren() { this.children = []; }
+  append(child) { this.children.push(child); }
+}
+const fakeDocument = {
+  querySelector(selector) {
+    if (!uiElements.has(selector)) uiElements.set(selector, new FakeElement());
+    return uiElements.get(selector);
+  },
+  createElement() { return new FakeElement(); },
+};
+const uiRequests = [];
+const fakeFetch = async path => {
+  uiRequests.push(path);
+  if (path === "/api/status") return Response.json({
+    authenticated: true, connected: true, connectedAt: Date.now(), region: "us",
+    selectedAccount: { id: "account-second", name: "Second account" },
+    meteredReadsEnabled: true, tokenRefreshDue: false, requiresReauthentication: false,
+    refreshError: null, providerReachable: null, statusSource: "local_metadata",
+  });
+  if (path === "/api/accounts") return Response.json({
+    accounts: [{ id: "account-first", name: "First account" }, { id: "account-second", name: "Second account" }],
+    selectedAccount: { id: "account-second", name: "Second account" },
+  });
+  throw new Error("Unexpected UI request " + path);
+};
+runInNewContext(page.match(/<script>([\s\S]*?)<\/script>/)[1], {
+  document: fakeDocument, fetch: fakeFetch, Response, Date, setTimeout,
+});
+await new Promise(resolve => setTimeout(resolve, 0));
+assert.deepEqual(uiRequests, ["/api/status"], "status view must not auto-fetch accounts even after metered reads are enabled");
+await uiElements.get("#load-accounts").listeners.click();
+assert.deepEqual(uiRequests, ["/api/status", "/api/accounts"]);
+assert.equal(uiElements.get("#account").children[0].selected, false);
+assert.equal(uiElements.get("#account").children[1].selected, true,
+  "the saved account remains selected even when it is not the first listed account");
+assert.equal(uiElements.get("#select-account").disabled, false);
 const statusWithoutIdentity = await worker.fetch(new Request("https://example.test/api/status"), {});
 assert.equal(statusWithoutIdentity.status, 200);
 assert.equal((await statusWithoutIdentity.json()).authenticated, false);
@@ -719,8 +793,7 @@ const manualPageResponse = await worker.fetch(new Request("https://example.test/
 assert.equal(manualPageResponse.status, 200);
 assert.match(await manualPageResponse.text(), /api\/oauth\/manual-complete/);
 
-// `get_connection_status` performs a refresh-capable lookup. A failing provider
-// must not let that request bypass the per-user limiter before attempting OAuth.
+// Status uses local metadata only, even when the stored access token is near expiry.
 const statusDb = new MemoryD1();
 const statusUserId = await siteUserId(new Request("https://example.test/", {
   headers: { "oai-authenticated-user-id": "status-rate-limit-identity" },
@@ -735,14 +808,11 @@ statusDb.connections.set(statusUserId, {
 });
 const statusEnv = { ...env, DB: statusDb };
 let statusRefreshCalls = 0;
-globalThis.fetch = async () => {
-  statusRefreshCalls += 1;
-  return Response.json({ error: "invalid_grant" }, { status: 400 });
-};
+globalThis.fetch = async () => { statusRefreshCalls += 1; throw new Error("status must not call the provider"); };
 for (let index = 0; index < 25; index += 1) {
   await call("tools/call", { name: "get_connection_status", arguments: {} }, statusEnv, "status-rate-limit-identity");
 }
-assert.equal(statusRefreshCalls, 20, "status refreshes must be limited before the provider request");
+assert.equal(statusRefreshCalls, 0, "status lookups must not refresh tokens or contact the provider");
 assert.equal(statusDb.rates.get(statusUserId + ":" + Math.floor(Date.now() / 60000)).call_count, 25);
 globalThis.fetch = originalFetch;
 
@@ -871,7 +941,10 @@ globalThis.fetch = async () => {
   return new Response(JSON.stringify({ access_token: "new-access", refresh_token: "refresh-two", expires_in: 300 }), { status: 200 });
 };
 try {
-  const results = await Promise.all([getConnectionStatus({ ...env, DB: concurrentDb }, userId), getConnectionStatus({ ...env, DB: concurrentDb }, userId)]);
+  const results = await Promise.all([
+    getConnectionStatus({ ...env, DB: concurrentDb }, userId, { refreshIfNeeded: true }),
+    getConnectionStatus({ ...env, DB: concurrentDb }, userId, { refreshIfNeeded: true }),
+  ]);
   assert.equal(refreshCount, 1);
   assert.ok(results.every((value) => value.connected));
   assert.equal(await decryptSecret(concurrentDb.connections.get(userId).encrypted_refresh_token, env), "refresh-two");
@@ -918,7 +991,7 @@ globalThis.fetch = async () => {
   return new Response(JSON.stringify({ access_token: "obsolete-access", refresh_token: "obsolete-refresh", expires_in: 300 }), { status: 200 });
 };
 try {
-  await getConnectionStatus({ ...env, DB: replacedDb }, userId);
+  await getConnectionStatus({ ...env, DB: replacedDb }, userId, { refreshIfNeeded: true });
   assert.equal(replacedDb.connections.get(userId).encrypted_refresh_token, replacementRefresh);
   assert.equal(replacedDb.locks.size, 0);
 } finally { globalThis.fetch = originalFetch; }

@@ -62,7 +62,7 @@ const TOOLS = [
   },
   {
     name: "get_connection_status",
-    description: "New Relic接続状態を確認します。公式MCPの到達性確認は利用量を消費する可能性があり、Site管理者が明示的に有効化した場合のみ実行します。アクセストークン等は返しません。",
+    description: "ローカル保存された接続メタデータだけを確認します。New Relicへ接続せず、アクセストークンも更新しません。プロバイダーの到達性・トークン有効性は未確認として返します。",
     inputSchema: { type: "object", properties: {}, required: [], additionalProperties: false },
   },
   {
@@ -375,30 +375,17 @@ async function callNrql(session, accountId, nrql) {
   return callNewRelicTool(session, toolName, { accountId, nrql, query: nrql, limit: 100 });
 }
 
-async function verifyConnection(env, userId) {
-  // Status reads can refresh OAuth credentials, so rate-limit before the
-  // refresh-capable connection lookup rather than after it.
+async function getLocalConnectionStatus(env, userId) {
   await consumeRateLimit(env, userId);
   const status = await getConnectionStatus(env, userId);
   if (!status.connected) return status;
-  if (status.requiresReauthentication || status.refreshError) {
-    return { ...status, providerReachable: null, message: status.refreshError?.message || "認証の再確認が必要です。" };
-  }
-  try {
-    const accounts = await withNewRelicSession(env, userId, (session) => fetchAccounts(session, userId, env));
-    return {
-      ...await getConnectionStatus(env, userId),
-      providerReachable: true,
-      accountCount: accounts.accounts.length,
-    };
-  } catch (error) {
-    if (error instanceof NewRelicAuthError) {
-      return { ...status, providerReachable: ["access_token_rejected", "access_token_rejected_after_refresh"].includes(error.code) ? true : null, requiresReauthentication: error.requiresReauthentication === true, errorCode: error.code, message: error.message };
-    }
-    return { ...status, providerReachable: ["permission_denied", "provider_rate_limited"].includes(error.code) ? true : null, errorCode: error.code, message: error.code === "metered_reads_disabled"
-      ? "接続情報は保存されています。New Relicへの読み取り到達性確認はCore Computeなどの利用量が発生する可能性があるため、Site管理者の明示的な有効化まで実行しません。"
-      : error.message || "New Relicへの到達性を確認できませんでした。" };
-  }
+  return {
+    ...status,
+    providerReachable: null,
+    message: status.tokenRefreshDue
+      ? "ローカルの接続情報を確認しました。アクセストークン期限が近いか期限切れです。New Relicへの接続・トークン更新は実行していません。"
+      : "ローカルの接続情報を確認しました。New Relicへの到達性は確認していません。",
+  };
 }
 
 async function handleTool(name, args, request, env, userId) {
@@ -423,7 +410,7 @@ async function handleTool(name, args, request, env, userId) {
   }
   if (name === "get_connection_status") {
     needIdentity(userId);
-    return toolSuccess(await verifyConnection(env, userId));
+    return toolSuccess(await getLocalConnectionStatus(env, userId));
   }
   if (name === "disconnect_new_relic") {
     needIdentity(userId);

@@ -5,7 +5,7 @@ This is a public-documentation inventory, **not a captured authenticated `tools/
 ## Evidence and live verification boundary
 
 - [Official tool reference](https://docs.newrelic.com/docs/agentic-ai/mcp/tool-reference/) was retrieved on 2026-11-06. It documents category filtering through the `include-tags` header and a stated limit of 2,000 calls/hour/user (subject to change).
-- A read-only call to the existing installed plugin's connection status reproduced `connected: true`, `requiresReauthentication: true`, `providerReachable: false`, and a refresh-failure message. It did **not** disclose the provider's error code. This does not establish the user's actual root cause.
+- A historical request to the existing installed plugin's connection-status tool returned `connected: true`, `requiresReauthentication: true`, `providerReachable: false`, and a refresh-failure message, but no provider error code. Although the tool was described as read-only, the project implementation's status path could attempt token refresh and, if metered reads were enabled, an official account-list read. The returned text cannot establish whether a token refresh or billable provider call occurred, so we do not treat that invocation as side-effect-free evidence. It does not establish the user's actual root cause and was not repeated.
 - An unauthenticated GET to the fixed US MCP endpoint returned HTTP 401 on 2026-11-06 at 08:47:16 UTC. The provider was reachable from this research environment. Authentication failure is not proof of network failure. No authenticated tools were called successfully and no live account-data test passed in this research.
 - Public [protected-resource metadata](https://mcp.newrelic.com/.well-known/oauth-protected-resource) advertises the MCP resource and authorization server. Public [authorization-server metadata](https://oauth2.service.newrelic.com/.well-known/oauth-authorization-server) advertises `authorization_code`, `refresh_token`, PKCE `S256`, token auth method `none`, and `offline`, `offline_access`, `observability:read`. Do not infer that every client ID or redirect URI is registered merely from server-wide metadata.
 - The MCP challenge also advertises `dashboards:modify` and `alerts:modify`. These scopes were not requested. Their presence does not establish that undocumented write tools exist or are safe to expose.
@@ -55,6 +55,6 @@ Do not forward the MCP OAuth bearer token to NerdGraph or Blob Storage merely be
 ## Remaining evidence needed
 
 1. Authenticated, paginated runtime `tools/list` snapshot, sanitized before persistence, with actual schemas and account-visible tool count.
-2. Real OAuth refresh error classification from safe diagnostics, then a read-only live data test after the deployment is separately approved.
+2. A non-secret OAuth refresh error code from an existing diagnostic record, or a separately authorized controlled refresh probe (which can rotate the refresh token), then a read-only live data test only after separately reviewing billing and deployment approval.
 3. Account contract/entitlements for Core/Advanced Compute and preview enablement. No free-tier conclusion follows from successful authentication.
 4. Feature-specific User API key configuration only through an approved secure setup if an API adapter is selected.

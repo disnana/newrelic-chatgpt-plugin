@@ -452,17 +452,17 @@ export async function completePastedNewRelicAuthorization(callbackUrl, env, expe
   }, env, expectedUserId);
 }
 
-export async function getConnectionStatus(env, userId) {
+export async function getConnectionStatus(env, userId, { refreshIfNeeded = false } = {}) {
   if (!userId) return { authenticated: false, connected: false, requiresSiteAuthentication: true };
   const connection = await database(env).prepare(
     "SELECT connected_at, access_expires_at, region FROM nr_connections WHERE user_id = ?",
   ).bind(userId).first();
   if (!connection) return { authenticated: true, connected: false, selectedAccount: null };
 
+  let currentConnection = connection;
   let requiresReauthentication = false;
   let refreshError = null;
-  let currentConnection = connection;
-  if (Number(connection.access_expires_at) <= Date.now() + 30000) {
+  if (refreshIfNeeded && Number(connection.access_expires_at) <= Date.now() + 30000) {
     try {
       await accessToken(env, userId);
       currentConnection = await database(env).prepare(
@@ -473,16 +473,20 @@ export async function getConnectionStatus(env, userId) {
       refreshError = { code: error.code || "storage_error", retryable: Boolean(error.retryable), message: error instanceof NewRelicAuthError || error instanceof NewRelicRemoteError ? error.message : "認証情報の保存処理を確認してください。" };
     }
   }
+  const accessTokenExpiresAt = Number(currentConnection.access_expires_at);
   return {
     authenticated: true,
     connected: true,
     connectedAt: Number(connection.connected_at),
-    accessTokenExpiresAt: Number(currentConnection.access_expires_at),
+    accessTokenExpiresAt: Number.isFinite(accessTokenExpiresAt) ? accessTokenExpiresAt : null,
     region: validRegion(currentConnection.region),
     selectedAccount: await getSelectedAccount(env, userId),
     meteredReadsEnabled: env?.NEW_RELIC_ENABLE_METERED_READS === "true",
+    tokenRefreshDue: !Number.isFinite(accessTokenExpiresAt) || accessTokenExpiresAt <= Date.now() + 30000,
     requiresReauthentication,
     refreshError,
+    providerReachable: null,
+    statusSource: refreshIfNeeded ? "token_refresh_probe" : "local_metadata",
     refreshPolicy: { proactiveWindowSeconds: 30, providerReauthenticationHours: 24 },
   };
 }

@@ -80,11 +80,12 @@
         </div>
         <div id="connected-panel" hidden>
           <p id="connection-detail"></p>
-          <div class="controls">
+          <div id="account-controls" class="controls" hidden>
             <label for="account">使用するNew Relicアカウント
               <select id="account"></select>
             </label>
-            <button id="select-account" type="button" class="secondary">アカウントを選択</button>
+            <button id="load-accounts" type="button" class="secondary">アカウント一覧を取得（利用量の可能性あり）</button>
+            <button id="select-account" type="button" class="secondary" disabled>アカウントを選択</button>
           </div>
           <p id="account-hint" class="hint"></p>
           <div class="actions">
@@ -103,11 +104,14 @@
       const statusText = document.querySelector("#status-text");
       const connectPanel = document.querySelector("#connect-panel");
       const connectedPanel = document.querySelector("#connected-panel");
+      const accountControls = document.querySelector("#account-controls");
       const identityHint = document.querySelector("#identity-hint");
       const accountSelect = document.querySelector("#account");
       const accountHint = document.querySelector("#account-hint");
       const connectionDetail = document.querySelector("#connection-detail");
       const connectLink = document.querySelector("#connect-link");
+      const loadAccountsButton = document.querySelector("#load-accounts");
+      const selectAccountButton = document.querySelector("#select-account");
 
       async function api(path, options) {
         const response = await fetch(path, Object.assign({ cache: "no-store" }, options || {}));
@@ -122,14 +126,17 @@
       }
 
       async function loadAccounts(selected) {
+        loadAccountsButton.disabled = true;
+        selectAccountButton.disabled = true;
         try {
           const data = await api("/api/accounts");
+          const activeSelection = selected || data.selectedAccount;
           accountSelect.replaceChildren();
           for (const account of data.accounts || []) {
             const option = document.createElement("option");
             option.value = account.id;
             option.textContent = account.name ? account.name + "（" + account.id + "）" : account.id;
-            option.selected = account.id === (selected && selected.id);
+            option.selected = account.id === (activeSelection && activeSelection.id);
             accountSelect.append(option);
           }
           if (!data.accounts || data.accounts.length === 0) {
@@ -141,9 +148,13 @@
           } else {
             accountHint.textContent = "複数アカウントがあります。使用するものを選んでください。";
           }
+          accountHint.classList.remove("error");
+          selectAccountButton.disabled = !data.accounts || data.accounts.length === 0;
         } catch (error) {
           accountHint.textContent = error.message;
           accountHint.classList.add("error");
+        } finally {
+          loadAccountsButton.disabled = false;
         }
       }
 
@@ -152,6 +163,8 @@
         identityHint.hidden = true;
         connectPanel.hidden = true;
         connectedPanel.hidden = true;
+        accountControls.hidden = true;
+        selectAccountButton.disabled = true;
         try {
           const state = await api("/api/status");
           if (!state.authenticated) {
@@ -181,9 +194,20 @@
           }
           setStatus("connected", "New Relic接続済み");
           const date = state.connectedAt ? new Date(state.connectedAt).toLocaleString("ja-JP") : "";
-          connectionDetail.textContent = "接続日時: " + (date || "不明") + " · リージョン: " + state.region.toUpperCase();
+          connectionDetail.textContent = "接続日時: " + (date || "不明") + " · リージョン: " + state.region.toUpperCase()
+            + (state.tokenRefreshDue ? " · 次のNew Relic操作でトークン更新が必要になる可能性があります" : "");
           connectedPanel.hidden = false;
-          await loadAccounts(state.selectedAccount);
+          if (state.meteredReadsEnabled) {
+            accountControls.hidden = false;
+            accountHint.textContent = state.selectedAccount
+              ? "保存済みの選択: " + (state.selectedAccount.name || state.selectedAccount.id) + "。一覧取得はボタンを押したときだけ行います。"
+              : "アカウント一覧はボタンを押したときだけ取得します。Core Compute等の利用量が発生する可能性があります。";
+          } else {
+            accountHint.textContent = state.selectedAccount
+              ? "保存済みの選択: " + (state.selectedAccount.name || state.selectedAccount.id) + "。新しい一覧取得は既定で停止しています。"
+              : "アカウント一覧は既定で停止しています。Site管理者が利用量を確認し、明示的に有効化するまで取得しません。";
+          }
+          accountHint.classList.remove("error");
         } catch (error) {
           setStatus("error", "状態を取得できません");
           identityHint.textContent = error.message;
@@ -195,8 +219,9 @@
         connectLink.href = "/oauth/start?region=" + encodeURIComponent(event.target.value);
       });
       document.querySelector("#refresh").addEventListener("click", refresh);
-      document.querySelector("#select-account").addEventListener("click", async () => {
-        const button = document.querySelector("#select-account");
+      loadAccountsButton.addEventListener("click", () => loadAccounts());
+      selectAccountButton.addEventListener("click", async () => {
+        const button = selectAccountButton;
         button.disabled = true;
         try {
           const result = await api("/api/select-account", {
