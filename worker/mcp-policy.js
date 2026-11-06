@@ -6,10 +6,15 @@ export class McpPolicyError extends Error {
 const plain = value => value !== null && typeof value === 'object' && !Array.isArray(value)
   && [Object.prototype, null].includes(Object.getPrototypeOf(value));
 const forbidden = new Set(['__proto__', 'prototype', 'constructor']);
-const supported = new Set(['type','properties','required','additionalProperties','items','enum','const','anyOf','oneOf','allOf','minimum','maximum','exclusiveMinimum','exclusiveMaximum','minLength','maxLength','minItems','maxItems','uniqueItems','description','title','default','$schema','examples','deprecated']);
+const supported = new Set(['type','properties','required','additionalProperties','items','enum','const','anyOf','oneOf','allOf','minimum','maximum','exclusiveMinimum','exclusiveMaximum','minLength','maxLength','minItems','maxItems','uniqueItems','description','title','default','$schema','$defs','$ref','examples','deprecated']);
+const schemaTypes = new Set(['object','array','string','integer','number','boolean','null']);
 const MAX_CANONICAL_DEPTH = 32;
 const MAX_CANONICAL_NODES = 25000;
 const MAX_CANONICAL_BYTES = 1024 * 1024;
+const MAX_SCHEMA_DEPTH = 12;
+const MAX_SCHEMA_NODES = 25000;
+const MAX_SCHEMA_DEFINITIONS = 100;
+const MAX_SCHEMA_VALIDATION_DEPTH = 16;
 function appendCanonicalToken(token, state) {
   state.bytes += new TextEncoder().encode(token).byteLength;
   if (state.bytes > MAX_CANONICAL_BYTES) throw new McpPolicyError('unsupported_schema', 'MCP schema / policy validation failed: canonical_size_limit');
@@ -47,63 +52,183 @@ export async function schemaFingerprint(tool) {
 }
 /** @returns {never} */
 function fail(code='invalid_arguments') { throw new McpPolicyError(code, 'MCP schema / policy validation failed: ' + code); }
-export function checkSchema(schema, depth=0) {
-  if (depth > 12 || !plain(schema) || Object.keys(schema).some(k=>!supported.has(k))) fail('unsupported_schema');
-  for (const key of ['minimum','maximum','exclusiveMinimum','exclusiveMaximum']) if(schema[key]!==undefined && (typeof schema[key]!=='number'||!Number.isFinite(schema[key]))) fail('unsupported_schema');
-  for (const key of ['minLength','maxLength','minItems','maxItems']) if(schema[key]!==undefined && (!Number.isSafeInteger(schema[key])||schema[key]<0)) fail('unsupported_schema');
-  if(schema.uniqueItems!==undefined && typeof schema.uniqueItems!=='boolean') fail('unsupported_schema');
-  if(schema.enum!==undefined && (!Array.isArray(schema.enum)||!schema.enum.length||schema.enum.length>100)) fail('unsupported_schema');
-  if (schema.type !== undefined && !['object','array','string','integer','number','boolean','null'].includes(schema.type)) fail('unsupported_schema');
-  for (const key of ['description','title']) if(schema[key]!==undefined && typeof schema[key]!=='string') fail('unsupported_schema');
-  if (Object.hasOwn(schema,'properties')) {
-    if (!plain(schema.properties) || Object.keys(schema.properties).length > 100) fail('unsupported_schema');
-    for (const [k,v] of Object.entries(schema.properties)) { if (forbidden.has(k)) fail('unsafe_schema'); checkSchema(v, depth+1); }
-  }
-  if (Object.hasOwn(schema,'required')) {
-    if (!Array.isArray(schema.required) || schema.required.length>100
-      || schema.required.some(k=>typeof k!=='string'||forbidden.has(k))
-      || new Set(schema.required).size!==schema.required.length) fail('unsafe_schema');
-  }
-  if (schema.additionalProperties !== undefined && typeof schema.additionalProperties !== 'boolean') checkSchema(schema.additionalProperties,depth+1);
-  if (Object.hasOwn(schema,'items')) checkSchema(schema.items,depth+1);
-  for (const key of ['anyOf','oneOf','allOf']) if (Object.hasOwn(schema,key)) {
-    if (!Array.isArray(schema[key]) || !schema[key].length || schema[key].length>10) fail('unsupported_schema');
-    for(const child of schema[key]) checkSchema(child,depth+1);
-  }
+function resolveLocalDefinition(reference, rootSchema) {
+  const prefix = '#/$defs/';
+  if (typeof reference !== 'string' || !reference.startsWith('#')) fail('unsupported_schema');
+  let decodedReference;
+  try { decodedReference = decodeURIComponent(reference); }
+  catch { fail('unsupported_schema'); }
+  if (!decodedReference.startsWith(prefix)) fail('unsupported_schema');
+  const encodedName = decodedReference.slice(prefix.length);
+  if (!encodedName || encodedName.includes('/') || /~(?![01])/.test(encodedName)) fail('unsupported_schema');
+  const name = encodedName.replace(/~1/g, '/').replace(/~0/g, '~');
+  const definitions = plain(rootSchema) ? rootSchema.$defs : null;
+  if (forbidden.has(name) || !plain(definitions) || !Object.hasOwn(definitions, name)) fail('unsupported_schema');
+  return { name, schema: definitions[name] };
 }
-export function validateSchema(value, schema, depth=0) {
-  if (depth===0) checkSchema(schema);
-  if (depth>16) fail();
-  if (schema.enum && !schema.enum.some(v=>canonicalJson(v)===canonicalJson(value))) fail();
-  if (Object.hasOwn(schema,'const') && canonicalJson(schema.const)!==canonicalJson(value)) fail();
-  for(const key of ['anyOf','oneOf']) if(schema[key]) {
-    let count=0;
-    for(const child of schema[key]) { try { validateSchema(value,child,depth+1); count++; } catch {} }
-    if(key==='anyOf' ? count===0 : count!==1) fail();
+
+function checkSchemaNode(schema, depth, state, referenceStack) {
+  state.nodes += 1;
+  if (depth > MAX_SCHEMA_DEPTH || state.nodes > MAX_SCHEMA_NODES) fail('unsupported_schema');
+  if (typeof schema === 'boolean') return;
+  if (!plain(schema) || Object.keys(schema).some(key => !supported.has(key))) fail('unsupported_schema');
+  for (const key of ['minimum','maximum','exclusiveMinimum','exclusiveMaximum']) {
+    if (schema[key] !== undefined && (typeof schema[key] !== 'number' || !Number.isFinite(schema[key]))) fail('unsupported_schema');
   }
-  for(const child of schema.allOf || []) validateSchema(value,child,depth+1);
-  const type=schema.type;
-  if(type==='null' && value!==null || type==='object' && !plain(value) || type==='array' && !Array.isArray(value)
-    || type==='string' && typeof value!=='string' || type==='boolean' && typeof value!=='boolean'
-    || type==='integer' && !Number.isSafeInteger(value) || type==='number' && (typeof value!=='number'||!Number.isFinite(value))) fail();
-  if(typeof value==='string' && (value.length>(schema.maxLength??8192) || value.length<(schema.minLength??0))) fail();
-  if(typeof value==='number' && (value<(schema.minimum??-Infinity) || value>(schema.maximum??Infinity)
-    || value<=(schema.exclusiveMinimum??-Infinity) || value>=(schema.exclusiveMaximum??Infinity))) fail();
-  if(Array.isArray(value)) {
-    if(value.length>(schema.maxItems??100)||value.length<(schema.minItems??0)) fail();
-    if(schema.uniqueItems && new Set(value.map(item=>canonicalJson(item))).size!==value.length) fail();
-    for(const child of value) validateSchema(child,schema.items??{},depth+1);
+  for (const key of ['minLength','maxLength','minItems','maxItems']) {
+    if (schema[key] !== undefined && (!Number.isSafeInteger(schema[key]) || schema[key] < 0)) fail('unsupported_schema');
   }
-  if(plain(value)) {
-    if(Object.keys(value).length>100) fail();
-    for(const key of schema.required??[]) if(!Object.hasOwn(value,key)) fail();
-    for(const [k,v] of Object.entries(value)) {
-      if(forbidden.has(k)) fail();
-      if(Object.hasOwn(schema.properties??{},k)) validateSchema(v,schema.properties[k],depth+1);
-      else if(schema.additionalProperties===false) fail();
-      else validateSchema(v,plain(schema.additionalProperties)?schema.additionalProperties:{},depth+1);
+  if (schema.uniqueItems !== undefined && typeof schema.uniqueItems !== 'boolean') fail('unsupported_schema');
+  if (schema.enum !== undefined && (!Array.isArray(schema.enum) || !schema.enum.length || schema.enum.length > 100)) fail('unsupported_schema');
+  if (Object.hasOwn(schema, 'type')) {
+    const types = Array.isArray(schema.type) ? schema.type : [schema.type];
+    if (!types.length || types.length > schemaTypes.size || types.some(type => typeof type !== 'string' || !schemaTypes.has(type))
+      || new Set(types).size !== types.length) fail('unsupported_schema');
+  }
+  for (const key of ['description','title']) if (schema[key] !== undefined && typeof schema[key] !== 'string') fail('unsupported_schema');
+  if (Object.hasOwn(schema, '$defs')) {
+    if (schema !== state.root || !plain(schema.$defs) || Object.keys(schema.$defs).length > MAX_SCHEMA_DEFINITIONS) fail('unsupported_schema');
+    for (const [name, definition] of Object.entries(schema.$defs)) {
+      if (forbidden.has(name) || referenceStack.has(name)) fail('unsafe_schema');
+      referenceStack.add(name);
+      checkSchemaNode(definition, depth + 1, state, referenceStack);
+      referenceStack.delete(name);
     }
   }
+  if (Object.hasOwn(schema, '$ref')) {
+    const resolved = resolveLocalDefinition(schema.$ref, state.root);
+    if (referenceStack.has(resolved.name)) fail('unsupported_schema');
+    referenceStack.add(resolved.name);
+    checkSchemaNode(resolved.schema, depth + 1, state, referenceStack);
+    referenceStack.delete(resolved.name);
+  }
+  if (Object.hasOwn(schema, 'properties')) {
+    if (!plain(schema.properties) || Object.keys(schema.properties).length > 100) fail('unsupported_schema');
+    for (const [key, child] of Object.entries(schema.properties)) {
+      if (forbidden.has(key)) fail('unsafe_schema');
+      checkSchemaNode(child, depth + 1, state, referenceStack);
+    }
+  }
+  if (Object.hasOwn(schema, 'required')) {
+    if (!Array.isArray(schema.required) || schema.required.length > 100
+      || schema.required.some(key => typeof key !== 'string' || forbidden.has(key))
+      || new Set(schema.required).size !== schema.required.length) fail('unsafe_schema');
+  }
+  if (Object.hasOwn(schema, 'additionalProperties') && typeof schema.additionalProperties !== 'boolean') {
+    checkSchemaNode(schema.additionalProperties, depth + 1, state, referenceStack);
+  }
+  if (Object.hasOwn(schema, 'items')) checkSchemaNode(schema.items, depth + 1, state, referenceStack);
+  for (const key of ['anyOf','oneOf','allOf']) if (Object.hasOwn(schema, key)) {
+    if (!Array.isArray(schema[key]) || !schema[key].length || schema[key].length > 10) fail('unsupported_schema');
+    for (const child of schema[key]) checkSchemaNode(child, depth + 1, state, referenceStack);
+  }
+}
+
+export function checkSchema(schema, depth = 0) {
+  checkSchemaNode(schema, depth, { root: schema, nodes: 0 }, new Set());
+}
+
+function matchesType(value, type) {
+  switch (type) {
+    case 'null': return value === null;
+    case 'object': return plain(value);
+    case 'array': return Array.isArray(value);
+    case 'string': return typeof value === 'string';
+    case 'boolean': return typeof value === 'boolean';
+    case 'integer': return Number.isInteger(value);
+    case 'number': return typeof value === 'number' && Number.isFinite(value);
+    default: return false;
+  }
+}
+
+function jsonSchemaStringLength(value) {
+  let length = 0;
+  for (const _codePoint of value) length += 1;
+  return length;
+}
+
+function validateSchemaNode(value, schema, depth, state) {
+  state.nodes += 1;
+  if (depth > MAX_SCHEMA_VALIDATION_DEPTH || state.nodes > MAX_SCHEMA_NODES) fail('schema_validation_limit');
+  if (typeof schema === 'boolean') {
+    if (!schema) fail();
+    return validateUnconstrainedValue(value, depth, state);
+  }
+  if (!plain(schema)) fail('unsupported_schema');
+  if (Object.hasOwn(schema, '$ref')) {
+    const resolved = resolveLocalDefinition(schema.$ref, state.root);
+    if (state.referenceStack.has(resolved.name)) fail('unsupported_schema');
+    state.referenceStack.add(resolved.name);
+    try { validateSchemaNode(value, resolved.schema, depth + 1, state); }
+    finally { state.referenceStack.delete(resolved.name); }
+  }
+  if (schema.enum && !schema.enum.some(item => canonicalJson(item) === canonicalJson(value))) fail();
+  if (Object.hasOwn(schema, 'const') && canonicalJson(schema.const) !== canonicalJson(value)) fail();
+  for (const key of ['anyOf','oneOf']) if (schema[key]) {
+    let count = 0;
+    for (const child of schema[key]) {
+      try {
+        validateSchemaNode(value, child, depth + 1, state);
+        count++;
+      } catch (error) {
+        // A branch mismatch is ordinary validation. Complexity, schema, and
+        // internal failures must not be miscounted as a nonmatching branch.
+        if (!(error instanceof McpPolicyError) || error.code !== 'invalid_arguments') throw error;
+      }
+    }
+    if (key === 'anyOf' ? count === 0 : count !== 1) fail();
+  }
+  for (const child of schema.allOf || []) validateSchemaNode(value, child, depth + 1, state);
+  if (Object.hasOwn(schema, 'type')) {
+    const types = Array.isArray(schema.type) ? schema.type : [schema.type];
+    if (!types.some(type => matchesType(value, type))) fail();
+  }
+  if (typeof value === 'string') {
+    if (schema.maxLength === undefined && value.length > 8192) fail('schema_validation_limit');
+    const codePointLength = jsonSchemaStringLength(value);
+    if (codePointLength > (schema.maxLength ?? 8192) || codePointLength < (schema.minLength ?? 0)) fail();
+  }
+  if (typeof value === 'number' && (value < (schema.minimum ?? -Infinity) || value > (schema.maximum ?? Infinity)
+    || value <= (schema.exclusiveMinimum ?? -Infinity) || value >= (schema.exclusiveMaximum ?? Infinity))) fail();
+  if (Array.isArray(value)) {
+    if (schema.maxItems === undefined && value.length > 100) fail('schema_validation_limit');
+    if (value.length > (schema.maxItems ?? 100) || value.length < (schema.minItems ?? 0)) fail();
+    if (schema.uniqueItems && new Set(value.map(item => canonicalJson(item))).size !== value.length) fail();
+    for (const child of value) validateSchemaNode(child, Object.hasOwn(schema, 'items') ? schema.items : {}, depth + 1, state);
+  }
+  if (plain(value)) {
+    if (Object.keys(value).length > 100) fail('schema_validation_limit');
+    for (const key of schema.required ?? []) if (!Object.hasOwn(value, key)) fail();
+    for (const [key, child] of Object.entries(value)) {
+      if (forbidden.has(key)) fail();
+      if (Object.hasOwn(schema.properties ?? {}, key)) validateSchemaNode(child, schema.properties[key], depth + 1, state);
+      else if (schema.additionalProperties === false) fail();
+      else if (Object.hasOwn(schema, 'additionalProperties')) {
+        validateSchemaNode(child, schema.additionalProperties, depth + 1, state);
+      } else validateSchemaNode(child, {}, depth + 1, state);
+    }
+  }
+}
+
+function validateUnconstrainedValue(value, depth, state) {
+  if (depth > MAX_SCHEMA_VALIDATION_DEPTH || state.nodes > MAX_SCHEMA_NODES) fail('schema_validation_limit');
+  if (typeof value === 'string' && value.length > 8192) fail('schema_validation_limit');
+  if (typeof value === 'number' && !Number.isFinite(value)) fail();
+  if (Array.isArray(value)) {
+    if (value.length > 100) fail('schema_validation_limit');
+    for (const child of value) validateSchemaNode(child, {}, depth + 1, state);
+  } else if (plain(value)) {
+    if (Object.keys(value).length > 100) fail('schema_validation_limit');
+    for (const [key, child] of Object.entries(value)) {
+      if (forbidden.has(key)) fail();
+      validateSchemaNode(child, {}, depth + 1, state);
+    }
+  }
+}
+
+export function validateSchema(value, schema) {
+  checkSchema(schema);
+  validateSchemaNode(value, schema, 0, { root: schema, referenceStack: new Set(), nodes: 0 });
 }
 export function readPolicies(env) {
   if(!env?.NEW_RELIC_MCP_POLICIES) return {};
@@ -135,7 +260,8 @@ export async function capabilityCatalog(tools,env,usageConsents={}) {
       // schema for review without making it executable.
       fingerprint=await schemaFingerprint(tool);
       checkSchema(tool.inputSchema);
-      if(tool.outputSchema) checkSchema(tool.outputSchema);
+      if (Object.hasOwn(tool, 'outputSchema')) checkSchema(tool.outputSchema);
+      if (tool.inputSchema === false || tool.outputSchema === false) fail('unsupported_schema');
     } catch { reason='unsupported_schema'; }
     if(!reason) {
       if(!policy) reason='policy_not_reviewed';
@@ -179,8 +305,9 @@ export function validateToolResult(result,definition) {
     // Do not relay resource links, embedded resources, images, or arbitrary remote fetch targets.
     if(!plain(item)||item.type!=='text'||typeof item.text!=='string') fail('unsupported_response_content');
   }
-  if(definition.outputSchema) validateSchema(result.structuredContent,definition.outputSchema);
+  const hasOutputSchema = Object.hasOwn(definition, 'outputSchema');
+  if (hasOutputSchema) validateSchema(result.structuredContent, definition.outputSchema);
   const safe = {content: result.content.map(item => ({type: 'text', text: item.text}))};
-  if(definition.outputSchema) safe.structuredContent = result.structuredContent;
+  if (hasOutputSchema) safe.structuredContent = result.structuredContent;
   return safe;
 }

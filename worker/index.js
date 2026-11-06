@@ -60,7 +60,7 @@ const SAFE_DIAGNOSTIC_CODES = new Set([
   "usage_consent_required", "advanced_compute_consent_required", "preview_consent_required",
   "catalog_snapshot_required", "catalog_changed", "capability_not_found", "schema_hash_required",
   "schema_changed_review_required", "schema_too_large", "schema_redacted_for_safety",
-  "invalid_catalog_request",
+  "invalid_catalog_request", "schema_validation_limit",
 ]);
 const JSON_HEADERS = {
   "content-type": "application/json; charset=utf-8",
