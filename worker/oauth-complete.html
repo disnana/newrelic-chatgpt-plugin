@@ -56,10 +56,12 @@
         status.className="status";
         status.textContent="認証を確認しています…";
         button.disabled=true;
+        let submissionAttempted=false;
         try{
           const headers={"content-type":"application/json"};
           const csrfToken=selfHostCsrfToken();
           if(csrfToken)headers["x-csrf-token"]=csrfToken;
+          submissionAttempted=true;
           const response=await fetch("/api/oauth/manual-complete",{
             method:"POST",
             headers,
@@ -67,19 +69,23 @@
             cache:"no-store",
             credentials:"same-origin"
           });
+          input.value="";
           const result=await response.json();
           if(!response.ok){
             const error=new Error(result.error||"認証を完了できませんでした。");
             if(typeof result.errorCode==="string")error.errorCode=result.errorCode;
             throw error;
           }
-          input.value="";
           status.className="status success";
           status.textContent="New Relicに接続しました。接続状態ページを開きます…";
           setTimeout(()=>location.replace("/"),900);
         }catch(error){
           status.className="status error";
           status.textContent=(error.message||"認証を完了できませんでした。")+(error.errorCode?" (code: "+error.errorCode+")":"");
+          if(submissionAttempted){
+            input.value="";
+            status.textContent+=" 通信結果が不明な場合があります。同じ認証URLは再送せず、接続を最初からやり直してください。";
+          }
           button.disabled=false;
         }
       });

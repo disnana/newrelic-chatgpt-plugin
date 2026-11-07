@@ -5,6 +5,15 @@ import { runInNewContext } from "node:vm";
 const html = await readFile(new URL("../worker/page.html", import.meta.url), "utf8");
 const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
 assert.ok(script, "the Site page must contain its inline controller");
+const connectedPanelStart = html.indexOf('<div id="connected-panel" hidden>');
+const connectedPanelEnd = html.indexOf("</section>", connectedPanelStart);
+assert.ok(connectedPanelStart >= 0 && connectedPanelEnd > connectedPanelStart,
+  "the reconnect state panel must remain identifiable in the Site page");
+const connectedPanelMarkup = html.slice(connectedPanelStart, connectedPanelEnd);
+assert.match(connectedPanelMarkup, /href="\/oauth\/complete"/,
+  "connected users can find the localhost callback paste page after starting reconnect");
+assert.match(connectedPanelMarkup, /localhost.*URL全体/s,
+  "the connected panel explains which callback URL to paste");
 
 class FakeElement {
   constructor(tag = "div") {
@@ -213,7 +222,7 @@ assert.ok(staleSchemaPanel.children[0].classList.contains("error"));
 const completionHtml = await readFile(new URL("../worker/oauth-complete.html", import.meta.url), "utf8");
 const completionScript = completionHtml.match(/<script>([\s\S]*?)<\/script>/)?.[1];
 assert.ok(completionScript, "the localhost-paste completion page must contain its controller");
-async function runCompletionPage(cookie) {
+async function runCompletionPage(cookie, { responseOk = true, fetchError = null } = {}) {
   const completionElements = new Map();
   const document = {
     cookie,
@@ -228,7 +237,9 @@ async function runCompletionPage(cookie) {
     document,
     fetch: async (path, options) => {
       call = { path, options };
-      return { ok: true, status: 200, json: async () => ({ ok: true }) };
+      if (fetchError) throw fetchError;
+      return { ok: responseOk, status: responseOk ? 200 : 502, json: async () => responseOk
+        ? ({ ok: true }) : ({ error: "New Relic OAuth temporarily failed.", errorCode: "oauth_network_error" }) };
     },
     setTimeout(callback) { callback(); },
     location: { replace(path) { replacedWith = path; } },
@@ -237,7 +248,8 @@ async function runCompletionPage(cookie) {
   const form = completionElements.get("#complete-form");
   completionElements.get("#callback-url").value = "http://localhost:12345/callback?code=synthetic&state=synthetic";
   await form.listeners.get("submit")[0]({ preventDefault() {} });
-  return { call, replacedWith };
+  return { call, replacedWith, callbackValue: completionElements.get("#callback-url").value,
+    statusText: completionElements.get("#status").textContent };
 }
 const selfHostCompletion = await runCompletionPage("__Host-nr-gateway-csrf=" + "K".repeat(43));
 assert.equal(selfHostCompletion.call.path, "/api/oauth/manual-complete");
@@ -245,9 +257,16 @@ assert.equal(selfHostCompletion.call.options.headers["x-csrf-token"], "K".repeat
   "the localhost-paste page includes the self-host CSRF header without putting it in the URL or body");
 assert.doesNotMatch(selfHostCompletion.call.options.body, /K{43}/);
 assert.equal(selfHostCompletion.replacedWith, "/");
+assert.equal(selfHostCompletion.callbackValue, "", "successful completion clears the one-time callback URL");
 const sitesCompletion = await runCompletionPage("");
 assert.equal(sitesCompletion.call.options.headers["x-csrf-token"], undefined,
   "the existing Sites flow remains unchanged when no self-host CSRF cookie exists");
+const networkFailedCompletion = await runCompletionPage("", { responseOk: false });
+assert.equal(networkFailedCompletion.callbackValue, "", "failed exchanges also clear the one-time callback URL");
+assert.match(networkFailedCompletion.statusText, /同じ認証URLは再送せず/,
+  "an uncertain token exchange tells users not to replay a one-time callback");
+const unreachableCompletion = await runCompletionPage("", { fetchError: new Error("network failed") });
+assert.equal(unreachableCompletion.callbackValue, "", "browser transport failure clears the callback URL too");
 console.log("PASS self-host CSRF header also protects the localhost OAuth completion form");
 
 const approvalPage = await mountPage({
