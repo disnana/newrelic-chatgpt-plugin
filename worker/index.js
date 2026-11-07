@@ -51,7 +51,7 @@ const MAX_TOOL_RESULT_BYTES = 10000;
 const MAX_CAPABILITY_DETAIL_BYTES = 64 * 1024;
 const MAX_CAPABILITY_SCHEMA_CHARACTERS = 1024 * 1024;
 const SAFE_DIAGNOSTIC_CODES = new Set([
-  "oauth_invalid_grant", "oauth_access_denied", "oauth_network_error", "oauth_rate_limited",
+  "oauth_invalid_grant", "oauth_access_denied", "oauth_network_error", "oauth_timeout", "oauth_rate_limited",
   "oauth_unavailable", "oauth_configuration_error", "oauth_rejected", "oauth_connection_cancelled",
   "invalid_token_response", "credential_storage_error", "connection_changed", "refresh_busy",
   "access_token_rejected", "access_token_rejected_after_refresh", "permission_denied",

@@ -322,8 +322,16 @@ async function tokenRequest(form) {
         headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json", "cache-control": "no-store" },
         body: new URLSearchParams(form), signal: AbortSignal.timeout(12000),
       });
-    } catch {
-      throw new NewRelicRemoteError("New Relic OAuthへの接続が一時的に失敗しました。認証情報は保持されています。", "oauth_network_error", true);
+    } catch (error) {
+      const name = error && typeof error === "object" && typeof error.name === "string" ? error.name : "";
+      const timedOut = name === "TimeoutError" || name === "AbortError";
+      throw new NewRelicRemoteError(
+        timedOut
+          ? "New Relic OAuthへの接続がタイムアウトしました。認証情報は保持されています。"
+          : "New Relic OAuthへの接続が一時的に失敗しました。認証情報は保持されています。",
+        timedOut ? "oauth_timeout" : "oauth_network_error",
+        true,
+      );
     }
     if (response.status === 429) {
       const retryAfter = Number(response.headers.get("retry-after") || 0);

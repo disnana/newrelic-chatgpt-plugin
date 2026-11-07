@@ -227,9 +227,15 @@ const rejectedOversizedApi = await worker.fetch(new Request("https://example.tes
 }), {});
 assert.equal((await rejectedOversizedApi.json()).error, "リクエストが大きすぎます。");
 
-const pong = await call("tools/call", { name: "ping", arguments: {} });
+const originalPingFetch = globalThis.fetch;
+let pingFetchCalls = 0;
+globalThis.fetch = async () => { pingFetchCalls++; throw new Error("ping must remain local"); };
+let pong;
+try { pong = await call("tools/call", { name: "ping", arguments: {} }); }
+finally { globalThis.fetch = originalPingFetch; }
 assert.equal(pong.payload.result.content[0].text, "pong");
 assert.equal(pong.payload.result.structuredContent.ok, true);
+assert.equal(pingFetchCalls, 0, "ping must not contact New Relic or the network");
 const oversizedId = await call("tools/call", { name: "ping", arguments: {} }, {}, null, "x".repeat(12000));
 assert.equal(oversizedId.payload.error.code, -32600);
 assert.equal(oversizedId.payload.id, null);
@@ -349,9 +355,16 @@ const signedPingRequest = new Request("https://example.test/mcp", {
   headers: { "content-type": "application/json", authorization: "Bearer " + ownerJwt, origin: "https://example.test" },
   body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "ping", arguments: {} } }),
 });
-const signedPing = await worker.fetch(signedPingRequest, signedProxyEnv);
+const signedPingOriginalFetch = globalThis.fetch;
+let signedPingFetchCalls = 0;
+globalThis.fetch = async () => { signedPingFetchCalls++; throw new Error("ping must remain local"); };
+let signedPing;
+try { signedPing = await worker.fetch(signedPingRequest, signedProxyEnv); }
+finally { globalThis.fetch = signedPingOriginalFetch; }
 assert.equal(signedPing.status, 200);
-assert.equal((await signedPing.json()).result.content[0].text, "pong");
+const signedPingBody = await signedPing.json();
+assert.equal(signedPingBody.result.content[0].text, "pong");
+assert.equal(signedPingFetchCalls, 0, "signed-proxy ping must not contact New Relic or the network");
 const signedCrossOrigin = await worker.fetch(new Request("https://example.test/mcp", {
   method: "POST",
   headers: { "content-type": "application/json", authorization: "Bearer " + ownerJwt, origin: "https://attacker.example" },
@@ -986,9 +999,12 @@ runInNewContext(manualPageHtml.match(/<script>([\s\S]*?)<\/script>/)[1], {
 });
 await completionElements.get("#complete-form").listeners.submit({ preventDefault() {} });
 assert.match(completionElements.get("#status").textContent, /oauth_invalid_grant/,
-  "OAuth completion failures should display the safe code while retaining the pasted URL for retry");
+  "OAuth completion failures should display the safe code");
+assert.match(completionElements.get("#status").textContent, /同じ認証URLは再送せず/,
+  "OAuth completion failures warn against replaying the one-time callback");
 assert.equal(completionElements.get("#submit-button").disabled, false);
-assert.equal(completionElements.get("#callback-url").value, "http://localhost:12345/callback?code=synthetic&state=synthetic");
+assert.equal(completionElements.get("#callback-url").value, "",
+  "the one-time callback URL is cleared after a failed token exchange");
 
 // Status uses local metadata only, even when the stored access token is near expiry.
 const statusDb = new MemoryD1();

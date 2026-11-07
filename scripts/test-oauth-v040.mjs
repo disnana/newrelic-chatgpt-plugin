@@ -3,6 +3,7 @@ import { webcrypto } from "node:crypto";
 import { encryptSecret, decryptSecret, getConnectionStatus, withNewRelicSession, callNewRelicRawTool, callNewRelicTool } from "../worker/newrelic.js";
 import { updateUsageConsents } from "../worker/usage-consent.js";
 globalThis.crypto ||= webcrypto;
+
 class MemoryD1 {
   states = new Map();
   connections = new Map();
@@ -154,6 +155,7 @@ for(const [name,response,code,reauth] of [
  ["malformed success",()=>Response.json({access_token:"",refresh_token:"test-secret-never-return"}),"invalid_token_response",false],
  ["bad expiry",()=>Response.json({access_token:"test-new-access",expires_in:-1}),"invalid_token_response",false],
  ["network ambiguity",()=>{throw Error("test-secret-never-return")},"oauth_network_error",false],
+ ["network timeout",()=>{throw Object.assign(Error("test-secret-never-return"),{name:"TimeoutError"})},"oauth_timeout",false],
 ]) await test(name+" preserves credentials and classifies safely",async()=>{
  const env=await fixture();const prior={...env.DB.connections.get(user)};let calls=0;globalThis.fetch=async()=>{calls++;return response()};
  const s=await getConnectionStatus(env,user,{refreshIfNeeded:true});assert.equal(s.requiresReauthentication,reauth);assert.equal(s.refreshError.code,code);assert.deepEqual(env.DB.connections.get(user),prior);assert.equal(calls,1);assert.equal(JSON.stringify(s).includes("test-secret-never-return"),false);
